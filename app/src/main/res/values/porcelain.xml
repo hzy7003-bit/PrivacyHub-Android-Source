@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ph_light_canvas">#FAF9F7</color>
+    <color name="ph_light_surface">#EFEEEC</color>
+    <color name="ph_light_surface_container_low">#F6F5F3</color>
+    <color name="ph_light_surface_container">#F0EFED</color>
+    <color name="ph_light_outline_variant">#D5D4D2</color>
+    <color name="ph_light_primary_container">#DEE0FF</color>
+    <color name="ph_light_text">#202127</color>
+    <color name="ph_light_muted">#64656F</color>
+    <color name="ph_light_primary">#555BC2</color>
+    <color name="ph_light_on_primary">#FFFFFF</color>
+    <color name="ph_light_danger">#B3261E</color>
+    <color name="ph_dark_canvas">#17181B</color>
+    <color name="ph_dark_surface">#27282E</color>
+    <color name="ph_dark_surface_container_low">#202126</color>
+    <color name="ph_dark_surface_container">#2D2E34</color>
+    <color name="ph_dark_outline_variant">#484950</color>
+    <color name="ph_dark_primary_container">#3E427A</color>
+    <color name="ph_dark_text">#F0EFF5</color>
+    <color name="ph_dark_muted">#B4B3BD</color>
+    <color name="ph_dark_primary">#B4B7FF</color>
+    <color name="ph_dark_on_primary">#242766</color>
+    <color name="ph_dark_danger">#FFB4AB</color>
+    <style name="PorcelainLight" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/ph_light_primary</item>
+        <item name="android:colorBackground">@color/ph_light_canvas</item>
+        <item name="android:windowBackground">@color/ph_light_canvas</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+    <style name="PorcelainDark" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/ph_dark_primary</item>
+        <item name="android:colorBackground">@color/ph_dark_canvas</item>
+        <item name="android:windowBackground">@color/ph_dark_canvas</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>

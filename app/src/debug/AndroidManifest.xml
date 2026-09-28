@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name=".presentation.autofill.AutofillTestActivity"
+            android:exported="false"
+            android:label="自动填充调试页" />
+    </application>
+</manifest>

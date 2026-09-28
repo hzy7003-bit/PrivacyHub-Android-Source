@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="notification_action_surface">@color/ph_dark_surface</color>
+    <color name="notification_action_text">@color/ph_dark_text</color>
+    <color name="notification_primary">@color/ph_dark_primary</color>
+    <color name="notification_on_primary">@color/ph_dark_on_primary</color>
+    <color name="notification_ripple">#33B4B7FF</color>
+</resources>

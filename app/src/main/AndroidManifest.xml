@@ -1,0 +1,237 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission
+        android:name="android.permission.USE_FINGERPRINT"
+        android:maxSdkVersion="28" />
+
+    <queries>
+        <package android:name="com.taobao.taobao" />
+        <package android:name="com.jingdong.app.mall" />
+        <package android:name="com.xunmeng.pinduoduo" />
+        <package android:name="com.xingin.xhs" />
+        <package android:name="com.ss.android.ugc.aweme" />
+        <package android:name="com.smile.gifmaker" />
+        <package android:name="tv.danmaku.bili" />
+        <package android:name="com.sina.weibo" />
+        <package android:name="com.baidu.netdisk" />
+        <package android:name="com.quark.browser" />
+        <package android:name="com.xunlei.downloadprovider" />
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".PrivacyHubApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name=".presentation.share.ShareReceiverActivity"
+            android:exported="true"
+            android:label="@string/share_receiver_label">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".presentation.share.ProcessTextReceiverActivity"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/process_text_receiver_label">
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".presentation.notification.NotificationEntryActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:finishOnTaskLaunch="true"
+            android:label="@string/notification_save_label"
+            android:launchMode="singleTask"
+            android:noHistory="true"
+            android:taskAffinity="com.privacyhub.notification"
+            android:theme="@style/TransparentActivityTheme" />
+
+        <activity
+            android:name=".presentation.transfer.TransferActivity"
+            android:exported="false"
+            android:label="中转" />
+
+        <activity
+            android:name=".presentation.vault.VaultDetailActivity"
+            android:exported="false"
+            android:label="@string/vault_detail_label" />
+
+        <activity
+            android:name=".presentation.SettingsActivity"
+            android:exported="false"
+            android:label="@string/settings_label" />
+
+        <activity
+            android:name=".presentation.category.CategoryManagementActivity"
+            android:exported="false"
+            android:label="@string/category_management_label" />
+
+        <activity
+            android:name=".presentation.category.HomeTagManagementActivity"
+            android:exported="false"
+            android:label="@string/category_management_label" />
+
+        <activity
+            android:name=".presentation.category.MoreCategoriesActivity"
+            android:exported="false"
+            android:label="@string/category_management_label" />
+
+        <activity
+            android:name=".presentation.category.CategoryDetailActivity"
+            android:exported="false"
+            android:label="@string/category_management_label" />
+
+        <activity
+            android:name=".presentation.search.SearchResultsActivity"
+            android:exported="false"
+            android:label="@string/app_name" />
+
+        <activity
+            android:name=".presentation.diagnostics.DiagnosticsActivity"
+            android:exported="false"
+            android:label="@string/diagnostics_label" />
+
+        <activity
+            android:name=".presentation.diagnostics.BackgroundHealthActivity"
+            android:exported="false"
+            android:label="@string/background_health_label" />
+
+        <activity
+            android:name=".presentation.guide.TrialGuideActivity"
+            android:exported="false"
+            android:label="@string/trial_guide_label" />
+
+        <activity
+            android:name=".presentation.pro.ProLicenseActivity"
+            android:exported="false"
+            android:label="@string/app_name" />
+
+        <activity
+            android:name=".presentation.backup.BackupActivity"
+            android:exported="false"
+            android:label="@string/app_name" />
+
+        <activity
+            android:name=".presentation.legal.ThirdPartyLicensesActivity"
+            android:exported="false"
+            android:label="@string/third_party_license_title" />
+
+        <activity
+            android:name=".presentation.autofill.AutofillCredentialActivity"
+            android:exported="false"
+            android:label="@string/app_name" />
+
+        <activity
+            android:name=".presentation.automation.NetdiskAutomationSettingsActivity"
+            android:exported="false"
+            android:label="@string/netdisk_automation_label" />
+
+        <activity
+            android:name=".autofill.AutofillAuthenticationActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:label="@string/app_name" />
+
+        <activity
+            android:name=".presentation.database.DatabaseUnavailableActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:label="@string/app_name" />
+
+        <activity
+            android:name=".presentation.MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name=".presentation.notification.BootNotificationReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".presentation.notification.PersistentSaveNotificationService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps a user-enabled local save shortcut visible in the notification shade." />
+        </service>
+
+        <service
+            android:name=".presentation.tile.SaveToVaultTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_privacy_hub"
+            android:label="@string/tile_save_to_vault"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="false" />
+        </service>
+
+        <service
+            android:name=".autofill.PrivacyHubAutofillService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_AUTOFILL_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.autofill.AutofillService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.autofill"
+                android:resource="@xml/autofill_service" />
+        </service>
+
+        <service
+            android:name=".automation.NetdiskAccessCodeAccessibilityService"
+            android:exported="true"
+            android:label="@string/netdisk_automation_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/netdisk_accessibility_service" />
+        </service>
+    </application>
+</manifest>

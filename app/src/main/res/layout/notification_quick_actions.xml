@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="@dimen/notification_action_height"
+    android:orientation="horizontal" android:baselineAligned="false">
+    <Button android:id="@+id/notification_save" style="@style/NotificationQuickAction"
+        android:layout_marginEnd="@dimen/notification_action_gap"
+        android:text="@string/notification_save"
+        android:background="@drawable/notification_action_secondary"
+        android:textColor="@color/notification_action_text" />
+    <Button android:id="@+id/notification_save_open" style="@style/NotificationQuickAction"
+        android:text="@string/notification_save_open"
+        android:background="@drawable/notification_action_primary"
+        android:textColor="@color/notification_on_primary" />
+</LinearLayout>

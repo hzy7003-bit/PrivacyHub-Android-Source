@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">隐私中转站</string>
+    <string name="share_receiver_label">隐私中转站</string>
+    <string name="process_text_receiver_label">存入隐私中转站</string>
+    <string name="tile_save_to_vault">保存到安全箱</string>
+    <string name="notification_save_label">保存到安全箱</string>
+    <string name="vault_detail_label">安全箱详情</string>
+    <string name="settings_label">设置</string>
+    <string name="category_management_label">分类管理</string>
+    <string name="diagnostics_label">诊断报告</string>
+    <string name="background_health_label">通知和后台检测</string>
+    <string name="trial_guide_label">试用版说明</string>
+    <string name="netdisk_automation_label">网盘自动填码</string>
+    <string name="netdisk_accessibility_description">仅在用户主动发起的网盘提取码任务中，查找明确标注的提取码输入框并填入内容；不会点击确认、提交或支付。</string>
+    <string name="third_party_license_title">第三方开源许可</string>
+    <string name="third_party_license_intro">本应用使用以下开源组件。完整声明与许可文本也随源码提供于 THIRD_PARTY_NOTICES.md。</string>
+    <string name="third_party_sqlcipher_license">SQLCipher Community Edition · BSD-style</string>
+    <string name="third_party_guava_license">Guava · Apache License 2.0</string>
+    <string name="third_party_androidx_license">其他 AndroidX / Kotlin 组件 · Apache License 2.0</string>
+    <string name="third_party_license_close">关闭</string>
+</resources>

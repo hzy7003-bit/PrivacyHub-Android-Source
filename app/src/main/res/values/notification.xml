@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="notification_action_height">48dp</dimen>
+    <dimen name="notification_action_gap">8dp</dimen>
+    <dimen name="notification_action_inset">4dp</dimen>
+    <!-- Compact visible surface; the button keeps its 48dp touch height. -->
+    <dimen name="notification_action_surface_inset">4dp</dimen>
+    <dimen name="notification_action_radius">10dp</dimen>
+    <dimen name="notification_action_text">13sp</dimen>
+    <dimen name="notification_action_text_min">8sp</dimen>
+    <color name="notification_action_surface">@color/ph_light_surface</color>
+    <color name="notification_action_text">@color/ph_light_text</color>
+    <color name="notification_primary">@color/ph_light_primary</color>
+    <color name="notification_on_primary">@color/ph_light_on_primary</color>
+    <color name="notification_ripple">#33555BC2</color>
+    <string name="notification_save">保存到安全箱</string>
+    <string name="notification_save_open">保存并跳转</string>
+    <style name="NotificationQuickAction" parent="android:style/Widget.Material.Button.Borderless">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">@dimen/notification_action_height</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">@dimen/notification_action_height</item>
+        <item name="android:paddingStart">@dimen/notification_action_inset</item>
+        <item name="android:paddingEnd">@dimen/notification_action_inset</item>
+        <item name="android:paddingTop">0dp</item>
+        <item name="android:paddingBottom">0dp</item>
+        <item name="android:textSize">@dimen/notification_action_text</item>
+        <item name="android:autoSizeTextType">uniform</item>
+        <item name="android:autoSizeMinTextSize">@dimen/notification_action_text_min</item>
+        <item name="android:autoSizeMaxTextSize">@dimen/notification_action_text</item>
+        <item name="android:autoSizeStepGranularity">1sp</item>
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:gravity">center</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:ellipsize">end</item>
+    </style>
+</resources>
