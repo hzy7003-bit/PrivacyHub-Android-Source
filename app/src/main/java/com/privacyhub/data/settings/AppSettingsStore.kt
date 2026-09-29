@@ -143,20 +143,20 @@ class AppSettingsStore(context: Context) {
         return categorySettings.addCategory(name)
     }
 
-    fun removeCustomCategory(name: String) {
-        categorySettings.removeCustomCategory(name)
+    fun removeCustomCategory(name: String): Boolean {
+        return categorySettings.removeCustomCategory(name)
     }
 
-    fun renameCustomCategory(oldName: String, newName: String) {
-        categorySettings.renameCustomCategory(oldName, newName)
+    fun renameCustomCategory(oldName: String, newName: String): Boolean {
+        return categorySettings.renameCustomCategory(oldName, newName)
     }
 
     fun resolveSuggestedCategory(category: String): String {
         return categorySettings.resolveSuggestedCategory(category)
     }
 
-    fun setCategoryAlias(systemCategory: String, userCategory: String) {
-        categorySettings.setCategoryAlias(systemCategory, userCategory)
+    fun setCategoryAlias(systemCategory: String, userCategory: String, dbCategories: List<String>): Boolean {
+        return categorySettings.setCategoryAlias(systemCategory, userCategory, dbCategories)
     }
 
     fun normalizeCategoryForStorage(category: String?): String? {
@@ -175,16 +175,16 @@ class AppSettingsStore(context: Context) {
         return categorySettings.homeTags(dbCategories)
     }
 
-    fun setHomeTags(tags: List<String>) {
-        categorySettings.setHomeTags(tags)
+    fun setHomeTags(tags: List<String>): Boolean {
+        return categorySettings.setHomeTags(tags)
     }
 
     fun addHomeTag(category: String, dbCategories: List<String>): Boolean {
         return categorySettings.addHomeTag(category, dbCategories)
     }
 
-    fun removeHomeTag(category: String) {
-        categorySettings.removeHomeTag(category)
+    fun removeHomeTag(category: String): Boolean {
+        return categorySettings.removeHomeTag(category)
     }
 
     fun moveHomeTag(category: String, direction: Int, dbCategories: List<String>): Boolean {

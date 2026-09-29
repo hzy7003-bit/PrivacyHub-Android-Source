@@ -5,4 +5,5 @@
     android:canRequestTouchExplorationMode="false"
     android:canRetrieveWindowContent="true"
     android:description="@string/netdisk_accessibility_description"
-    android:notificationTimeout="100" />
+    android:notificationTimeout="100"
+    android:packageNames="com.android.chrome,com.microsoft.emmx,com.sec.android.app.sbrowser,com.vivo.browser,org.mozilla.firefox,com.quark.browser" />

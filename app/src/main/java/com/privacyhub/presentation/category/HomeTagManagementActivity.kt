@@ -13,12 +13,20 @@ import com.privacyhub.data.settings.AppSettingsStore
 import com.privacyhub.presentation.security.SecureActivity
 import com.privacyhub.presentation.ui.ButtonKind
 import com.privacyhub.presentation.ui.FrostedUi
+import com.privacyhub.util.ActivityTaskScope
 
 class HomeTagManagementActivity : SecureActivity() {
-    private val store by lazy { LocalStore(this) }
+    private val tasks by lazy { ActivityTaskScope(this) }
+    private var operationInFlight = false
 
     override fun onUnlocked() {
+        if (operationInFlight) return
         render()
+    }
+
+    override fun onDestroy() {
+        tasks.close()
+        super.onDestroy()
     }
 
     private fun render() {
@@ -29,13 +37,42 @@ class HomeTagManagementActivity : SecureActivity() {
         root.addView(title("管理首页标签"))
         root.addView(subtitle("只控制首页显示，不会删除安全箱内容。最多显示 ${AppSettingsStore.MAX_HOME_TAGS} 个常用标签。"))
 
-        store.categorySettingsReadError()?.let { message ->
-            root.addView(emptyText(message))
+        root.addView(emptyText("正在读取标签…"))
+        root.addView(fullWidthButton("返回设置", ButtonKind.Secondary) { finish() })
+        setContentView(root)
+
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = {
+                val localStore = LocalStore(app)
+                val error = localStore.categorySettingsReadError()
+                HomeTagState(
+                    error = error,
+                    homeTags = if (error == null) localStore.homeTags() else emptyList(),
+                    allTags = if (error == null) localStore.categories() else emptyList()
+                )
+            },
+            onResult = { owner, result -> (owner as HomeTagManagementActivity).renderTags(result) }
+        )
+    }
+
+    private fun renderTags(result: Result<HomeTagState>) {
+        val state = result.getOrElse { error ->
+            showReadFailure(error)
+            return
+        }
+        if (state.error != null) {
+            val root = pageRoot()
+            root.addView(emptyText(state.error))
             root.addView(fullWidthButton("返回设置", ButtonKind.Secondary) { finish() })
             setContentView(root)
             return
         }
-
+        val root = pageRoot()
+        root.addView(title("管理首页标签"))
+        root.addView(subtitle("只控制首页显示，不会删除安全箱内容。最多显示 ${AppSettingsStore.MAX_HOME_TAGS} 个常用标签。"))
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -43,12 +80,8 @@ class HomeTagManagementActivity : SecureActivity() {
         }
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-
-        content.addView(fullWidthButton("新增标签", ButtonKind.Primary) {
-            showAddCategoryDialog()
-        })
-
-        val homeTags = store.homeTags()
+        content.addView(fullWidthButton("新增标签", ButtonKind.Primary) { showAddCategoryDialog() })
+        val homeTags = state.homeTags
         content.addView(sectionTitle("首页正在显示"))
         if (homeTags.isEmpty()) {
             content.addView(emptyText("当前首页只显示“更多”。"))
@@ -58,7 +91,7 @@ class HomeTagManagementActivity : SecureActivity() {
             }
         }
 
-        val hiddenTags = store.categories().filterNot { it in homeTags }
+        val hiddenTags = state.allTags.filterNot { it in homeTags }
         content.addView(sectionTitle("更多里的标签"))
         if (hiddenTags.isEmpty()) {
             content.addView(emptyText("所有标签都已经显示在首页。"))
@@ -72,24 +105,38 @@ class HomeTagManagementActivity : SecureActivity() {
         setContentView(root)
     }
 
+    private fun pageRoot() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        FrostedUi.applyPageChrome(this)
+    }
+
+    private fun showReadFailure(error: Throwable) {
+        val root = pageRoot()
+        root.addView(title("暂时无法读取标签"))
+        root.addView(emptyText(error.message ?: "原有数据未更改，请重试。"))
+        root.addView(fullWidthButton("重试", ButtonKind.Primary) { render() })
+        root.addView(fullWidthButton("返回设置", ButtonKind.Secondary) { finish() })
+        setContentView(root)
+    }
+
     private fun homeTagCard(category: String, index: Int, lastIndex: Int): LinearLayout {
         return card(category, "显示在首页常用标签区。") {
             val firstRow = LinearLayout(this@HomeTagManagementActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
             }
             firstRow.addView(rowButton("上移", enabled = index > 0) {
-                store.moveHomeTag(category, -1)
-                render()
+                val app = applicationContext
+                runOperation({ LocalStore(app).moveHomeTag(category, -1) }) { activity, _ -> activity.render() }
             })
             firstRow.addView(space(dp(8), 1))
             firstRow.addView(rowButton("下移", enabled = index < lastIndex) {
-                store.moveHomeTag(category, 1)
-                render()
+                val app = applicationContext
+                runOperation({ LocalStore(app).moveHomeTag(category, 1) }) { activity, _ -> activity.render() }
             })
             addView(firstRow)
             addView(fullWidthButton("从首页移除", ButtonKind.Secondary) {
-                store.removeHomeTag(category)
-                render()
+                val app = applicationContext
+                runOperation({ LocalStore(app).removeHomeTag(category) }) { activity, _ -> activity.render() }
             })
         }
     }
@@ -97,10 +144,13 @@ class HomeTagManagementActivity : SecureActivity() {
     private fun hiddenTagCard(category: String): LinearLayout {
         return card(category, "不在首页显示，但可以从“更多”进入。") {
             addView(fullWidthButton("添加到首页", ButtonKind.Secondary) {
-                if (store.addHomeTag(category)) {
-                    render()
-                } else {
-                    Toast.makeText(this@HomeTagManagementActivity, "首页最多显示 ${AppSettingsStore.MAX_HOME_TAGS} 个标签", Toast.LENGTH_SHORT).show()
+                val app = applicationContext
+                runOperation({ LocalStore(app).addHomeTag(category) }) { activity, added ->
+                    if (added) activity.render() else Toast.makeText(
+                        activity,
+                        "首页最多显示 ${AppSettingsStore.MAX_HOME_TAGS} 个标签",
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
             })
         }
@@ -123,14 +173,43 @@ class HomeTagManagementActivity : SecureActivity() {
                     Toast.makeText(this, "标签名不能为空", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
-                val added = store.addCategory(name)
-                if (!added) {
-                    Toast.makeText(this, "标签已存在或属于系统标签", Toast.LENGTH_SHORT).show()
-                } else if (!store.addHomeTag(name)) {
-                    Toast.makeText(this, "标签已新增，可在更多里找到", Toast.LENGTH_SHORT).show()
+                val app = applicationContext
+                runOperation({
+                    val localStore = LocalStore(app)
+                    val added = localStore.addCategory(name)
+                    val addedToHome = if (added) localStore.addHomeTag(name) else false
+                    AddHomeTagResult(added, addedToHome)
+                }) { activity, result ->
+                    if (!result.added) {
+                        Toast.makeText(activity, "标签已存在或属于系统标签", Toast.LENGTH_SHORT).show()
+                    } else if (!result.addedToHome) {
+                        Toast.makeText(activity, "标签已新增，可在更多里找到", Toast.LENGTH_SHORT).show()
+                    }
+                    activity.render()
                 }
-                render()
             }
+            .show()
+    }
+
+    private fun <R> runOperation(task: () -> R, onSuccess: (HomeTagManagementActivity, R) -> Unit) {
+        if (operationInFlight) return
+        operationInFlight = true
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(generation, task, onResult = { owner, result ->
+            val activity = owner as HomeTagManagementActivity
+            activity.operationInFlight = false
+            result.fold(
+                onSuccess = { onSuccess(activity, it) },
+                onFailure = { activity.showOperationFailure(it) }
+            )
+        })
+    }
+
+    private fun showOperationFailure(error: Throwable) {
+        AlertDialog.Builder(this)
+            .setTitle("操作未完成")
+            .setMessage(error.message ?: "原有数据未更改，请重试。")
+            .setPositiveButton("知道了", null)
             .show()
     }
 
@@ -217,4 +296,12 @@ class HomeTagManagementActivity : SecureActivity() {
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private data class HomeTagState(
+        val error: String?,
+        val homeTags: List<String>,
+        val allTags: List<String>
+    )
+
+    private data class AddHomeTagResult(val added: Boolean, val addedToHome: Boolean)
 }

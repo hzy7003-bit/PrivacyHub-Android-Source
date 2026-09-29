@@ -9,6 +9,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import com.privacyhub.clipboard.SafeClipboard
 import com.privacyhub.data.repository.LocalStore
 import com.privacyhub.data.settings.AppSettingsStore
@@ -20,15 +21,14 @@ import com.privacyhub.presentation.ui.PorcelainViews
 import com.privacyhub.presentation.ui.UiMetrics
 import com.privacyhub.presentation.vault.VaultDetailActivity
 import com.privacyhub.presentation.vault.VaultLinkActionPanelFactory
-import com.privacyhub.util.AppExecutors
+import com.privacyhub.util.ActivityTaskScope
 import com.privacyhub.util.Formatters
-import android.widget.Toast
 
 /** One already-persisted transfer. No duplicate plaintext draft or temporary database. */
 class TransferActivity : SecureActivity() {
     private var itemId = 0L
     private var opened = false
-    private var generation = 0
+    private val tasks by lazy { ActivityTaskScope(this) }
     private val store by lazy { LocalStore(applicationContext) }
     private val views by lazy { PorcelainViews(this) }
 
@@ -44,24 +44,29 @@ class TransferActivity : SecureActivity() {
     }
 
     override fun onPause() {
-        generation++
+        tasks.invalidate()
         super.onPause()
     }
 
+    override fun onDestroy() {
+        tasks.close()
+        super.onDestroy()
+    }
+
     override fun onUnlocked() {
-        val token = ++generation
+        val token = tasks.nextGeneration()
         val root = shell()
         root.addView(views.text("正在读取已保存的内容…", muted = true))
         setContentView(root)
         val app = applicationContext
         val id = itemId
-        AppExecutors.executeDisk {
-            val result = runCatching { LocalStore(app).getItem(id) }
-            AppExecutors.executeMain {
-                if (token != generation || isFinishing || isDestroyed) return@executeMain
-                result.fold(::render, { renderError() })
+        tasks.executeDisk(
+            generation = token,
+            task = { LocalStore(app).getItem(id) },
+            onResult = { activity, result ->
+                result.fold(activity::render) { activity.renderError() }
             }
-        }
+        )
     }
 
     private fun shell() = views.column().apply {

@@ -1,11 +1,14 @@
 package com.privacyhub.backup
 
 import android.content.Context
+import android.util.Log
 import com.privacyhub.autofill.AppSigningCertificate
 import com.privacyhub.autofill.AutofillScopePolicy
 import com.privacyhub.data.db.PrivacyHubDatabaseProvider
 import com.privacyhub.data.db.PrivacyHubRoomDatabase
 import com.privacyhub.data.db.AutofillCredentialDao
+import com.privacyhub.data.db.DatabaseAccessCoordinator
+import com.privacyhub.data.db.RestoreRecoveryPendingException
 import com.privacyhub.data.db.VaultItemDao
 import com.privacyhub.data.db.entity.AutofillCredentialEntity
 import com.privacyhub.data.db.entity.VaultItemEntity
@@ -13,37 +16,105 @@ import com.privacyhub.data.settings.AppSettingsStore
 
 class VaultBackupRepository(context: Context) {
     private val appContext = context.applicationContext
-    private val database = PrivacyHubDatabaseProvider.get(appContext)
-    private val vaultDao = database.vaultItemDao()
-    private val autofillCredentialDao = database.autofillCredentialDao()
+    private val database by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        PrivacyHubDatabaseProvider.get(appContext)
+    }
+    private val vaultDao by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { database.vaultItemDao() }
+    private val autofillCredentialDao by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { database.autofillCredentialDao() }
     private val settingsStore = AppSettingsStore(appContext)
-    private val restoreProtocol = RestoreProtocol(
-        database = RoomRestoreDatabaseGateway(
-            database = database,
-            vaultDao = vaultDao,
-            autofillCredentialDao = autofillCredentialDao,
-            itemMapper = ::toEntity,
-            credentialMapper = ::toCredentialEntity
-        ),
-        settings = AppSettingsRestoreGateway(settingsStore)
-    )
-
-    fun createPayload(nowMillis: Long = System.currentTimeMillis()): BackupPayload {
-        val items = vaultDao.all().map(::toBackupItem)
-        val credentials = autofillCredentialDao.all().map(::toBackupCredential)
-        return BackupPayload(
-            createdAtMillis = nowMillis,
-            items = items,
-            settings = settingsStore.portableBackupSettings(vaultDao.categories()),
-            autofillCredentials = credentials
+    private val restoreProtocol by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        RestoreProtocol(
+            database = RoomRestoreDatabaseGateway(
+                database = database,
+                vaultDao = vaultDao,
+                autofillCredentialDao = autofillCredentialDao,
+                itemMapper = ::toEntity,
+                credentialMapper = ::toCredentialEntity
+            ),
+            settings = AppSettingsRestoreGateway(settingsStore)
         )
     }
 
+    fun createPayload(nowMillis: Long = System.currentTimeMillis()): BackupPayload {
+        // Any legacy dangling references are repaired under the exclusive gate before the
+        // immutable backup snapshot is read under the shared gate.
+        DatabaseAccessCoordinator.withDatabaseWriteAccess {
+            settingsStore.allKnownCategories(vaultDao.categories())
+        }
+        return DatabaseAccessCoordinator.withDatabaseAccess {
+            val items = vaultDao.all().map(::toBackupItem)
+            val credentials = autofillCredentialDao.all().map(::toBackupCredential)
+            BackupPayload(
+                createdAtMillis = nowMillis,
+                items = items,
+                settings = settingsStore.portableBackupSettings(vaultDao.categories()),
+                autofillCredentials = credentials
+            )
+        }
+    }
+
     fun restore(payload: BackupPayload, mode: RestoreMode): RestoreResult =
-        restoreProtocol.restore(payload, mode)
+        DatabaseAccessCoordinator.withRestoreAccess {
+            val protocol = try {
+                restoreProtocol
+            } catch (error: Exception) {
+                DatabaseAccessCoordinator.markRestoreRecoveryPending(error)
+                Log.e(SECURITY_DIAGNOSTIC_TAG, "restore_recovery_incomplete")
+                throw error
+            }
+            if (DatabaseAccessCoordinator.isRestoreRecoveryPending()) {
+                try {
+                    protocol.recoverInterruptedRestore()
+                    DatabaseAccessCoordinator.markRestoreRecoveryComplete()
+                } catch (error: Exception) {
+                    DatabaseAccessCoordinator.markRestoreRecoveryPending(error)
+                    throw error
+                }
+            }
+            try {
+                protocol.restore(payload, mode)
+            } catch (error: RestoreConsistencyException) {
+                if (error.recoveryIncomplete) {
+                    DatabaseAccessCoordinator.markRestoreRecoveryPending(error)
+                    Log.e(SECURITY_DIAGNOSTIC_TAG, "restore_recovery_incomplete")
+                }
+                throw error
+            }
+        }
+
+    internal fun <T> runCoordinatedCategoryMutation(
+        prepareSettings: () -> Unit = {},
+        applyRoom: () -> T,
+        applySettings: () -> Boolean
+    ): T = DatabaseAccessCoordinator.withDatabaseWriteAccess {
+        val protocol = try {
+            restoreProtocol
+        } catch (error: Exception) {
+            throw markCategoryRecoveryIncomplete(error)
+        }
+        prepareSettings()
+        try {
+            protocol.runCoordinatedMutation(applyRoom, applySettings)
+        } catch (error: RestoreConsistencyException) {
+            if (error.recoveryIncomplete) {
+                throw markCategoryRecoveryIncomplete(error)
+            }
+            throw error
+        }
+    }
 
     fun recoverPendingRestore() {
-        restoreProtocol.recoverInterruptedRestore()
+        DatabaseAccessCoordinator.markRestoreRecoveryPending(RestoreRecoveryPendingException())
+        try {
+            DatabaseAccessCoordinator.withRestoreAccess {
+                restoreProtocol.recoverInterruptedRestore()
+                DatabaseAccessCoordinator.markRestoreRecoveryComplete()
+            }
+        } catch (error: Exception) {
+            DatabaseAccessCoordinator.markRestoreRecoveryPending(error)
+            Log.e(SECURITY_DIAGNOSTIC_TAG, "restore_recovery_incomplete")
+            throw error
+        }
     }
 
     private fun toBackupItem(entity: VaultItemEntity): VaultBackupItem {
@@ -124,6 +195,26 @@ class VaultBackupRepository(context: Context) {
             updatedAtMillis = credential.updatedAtMillis
         )
     }
+
+    private fun markCategoryRecoveryIncomplete(error: Throwable): RestoreConsistencyException {
+        val safeFailure = if (error is RestoreConsistencyException && error.recoveryIncomplete) {
+            error
+        } else {
+            RestoreConsistencyException(
+                "分类数据恢复尚未完成；数据库访问已暂停，请重新打开应用重试。",
+                error,
+                recoveryIncomplete = true
+            )
+        }
+        DatabaseAccessCoordinator.markRestoreRecoveryPending(safeFailure)
+        // State-only diagnostic: never include category names, item text, or exception data.
+        Log.e(SECURITY_DIAGNOSTIC_TAG, "cross_store_category_recovery_incomplete")
+        return safeFailure
+    }
+
+    private companion object {
+        const val SECURITY_DIAGNOSTIC_TAG = "PrivacyHub.Security"
+    }
 }
 
 enum class RestoreMode {
@@ -174,15 +265,15 @@ private class RoomRestoreDatabaseGateway(
             "SELECT operation_id, restore_mode, state, started_at FROM $JOURNAL_TABLE WHERE slot = 1"
         ).use { cursor ->
             if (!cursor.moveToFirst()) return@use null
-            val mode = RestoreMode.entries.firstOrNull { it.name == cursor.getString(1) }
-                ?: throw RestoreConsistencyException("恢复日志包含无效模式。")
+            val operation = RestoreJournalOperation.entries.firstOrNull { it.name == cursor.getString(1) }
+                ?: throw RestoreConsistencyException("恢复日志包含无效操作。")
             val state = RestoreJournalState.entries.firstOrNull { it.name == cursor.getString(2) }
                 ?: throw RestoreConsistencyException("恢复日志包含无效状态。")
             val startedAt = cursor.getLong(3)
             if (startedAt < 0L) throw RestoreConsistencyException("恢复日志时间无效。")
             RestoreJournal(
                 operationId = cursor.getString(0),
-                mode = mode,
+                operation = operation,
                 state = state,
                 startedAtMillis = startedAt
             )
@@ -195,7 +286,7 @@ private class RoomRestoreDatabaseGateway(
                 "VALUES (1, ?, ?, ?, ?)",
             arrayOf(
                 journal.operationId,
-                journal.mode.name,
+                journal.operation.name,
                 journal.state.name,
                 journal.startedAtMillis
             )
@@ -205,6 +296,7 @@ private class RoomRestoreDatabaseGateway(
     override fun restoreInTransaction(
         payload: BackupPayload,
         mode: RestoreMode,
+        operationId: String,
         applySettings: () -> Unit
     ): RestoreCounts {
         val sourceItems = payload.items.map(itemMapper)
@@ -219,16 +311,20 @@ private class RoomRestoreDatabaseGateway(
                 insertedCredentials = autofillCredentialDao.insertAllIgnore(sourceCredentials).count { it != -1L }
             )
             applySettings()
-            val updated = database.openHelper.writableDatabase.compileStatement(
-                "UPDATE $JOURNAL_TABLE SET state = ? WHERE slot = 1 AND state = ?"
-            ).run {
-                bindString(1, RestoreJournalState.DatabaseCommitted.name)
-                bindString(2, RestoreJournalState.Prepared.name)
-                executeUpdateDelete()
-            }
-            if (updated != 1) throw RestoreConsistencyException("无法提交恢复日志。")
+            markDatabaseCommitted(operationId)
             counts
         }
+    }
+
+    override fun <T> runCoordinatedMutationInTransaction(
+        operationId: String,
+        applyRoom: () -> T,
+        applySettings: () -> Unit
+    ): T = database.runInTransaction<T> {
+        val result = applyRoom()
+        applySettings()
+        markDatabaseCommitted(operationId)
+        result
     }
 
     override fun clearJournal(operationId: String) {
@@ -239,6 +335,19 @@ private class RoomRestoreDatabaseGateway(
             executeUpdateDelete()
         }
         if (deleted != 1) throw RestoreConsistencyException("无法清理恢复日志。")
+    }
+
+    private fun markDatabaseCommitted(operationId: String) {
+        val updated = database.openHelper.writableDatabase.compileStatement(
+            "UPDATE $JOURNAL_TABLE SET state = ? " +
+                "WHERE slot = 1 AND operation_id = ? AND state = ?"
+        ).run {
+            bindString(1, RestoreJournalState.DatabaseCommitted.name)
+            bindString(2, operationId)
+            bindString(3, RestoreJournalState.Prepared.name)
+            executeUpdateDelete()
+        }
+        if (updated != 1) throw RestoreConsistencyException("无法提交数据一致性日志。")
     }
 
     private companion object {

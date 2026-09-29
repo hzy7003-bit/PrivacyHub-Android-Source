@@ -136,6 +136,7 @@ class EncryptedSettingsStoreTest {
 internal class MemorySharedPreferences : SharedPreferences {
     private val values = linkedMapOf<String, Any?>()
     var commitResult: Boolean = true
+    var successfulCommitsBeforeFailure: Int? = null
     var failContains: Boolean = false
     override fun getAll(): Map<String, *> = values.toMap()
     override fun getString(key: String, defValue: String?): String? = values[key] as? String ?: defValue
@@ -176,6 +177,11 @@ internal class MemorySharedPreferences : SharedPreferences {
         override fun clear(): SharedPreferences.Editor = apply { clear = true }
         override fun commit(): Boolean {
             if (!commitResult) return false
+            val remaining = successfulCommitsBeforeFailure
+            if (remaining != null) {
+                if (remaining == 0) return false
+                successfulCommitsBeforeFailure = remaining - 1
+            }
             if (clear) values.clear()
             removed.forEach(values::remove)
             values.putAll(pending)

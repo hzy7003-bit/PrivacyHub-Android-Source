@@ -18,6 +18,8 @@ import com.privacyhub.presentation.settings.SettingsViewFactory
 import com.privacyhub.presentation.ui.ButtonKind
 import com.privacyhub.presentation.ui.FrostedUi
 import com.privacyhub.pro.ProLicenseStore
+import com.privacyhub.util.AppExecutors
+import com.privacyhub.domain.model.TestReport
 
 class SettingsActivity : SecureActivity() {
     private val store by lazy { LocalStore(this) }
@@ -91,8 +93,25 @@ class SettingsActivity : SecureActivity() {
         val clipboard = getSystemService(ClipboardManager::class.java)
         val text = "隐私中转站测试文本 https://example.com/?utm_source=test"
         clipboard.setPrimaryClip(ClipData.newPlainText("Privacy Hub Test", text))
-        store.recordReport(EntryPoint.MANUAL, true, null, LinkTarget.WEB, "已写入测试剪切板")
+        val localStore = store
+        AppExecutors.executeDisk {
+            runCatching { localStore.recordReport(EntryPoint.MANUAL, true, null, LinkTarget.WEB, "已写入测试剪切板") }
+        }
         Toast.makeText(this, "已写入测试剪切板", Toast.LENGTH_SHORT).show()
+    }
+
+    internal fun renderRecentReports(container: LinearLayout, result: Result<List<TestReport>>) {
+        if (isFinishing || isDestroyed) return
+        container.removeAllViews()
+        result.fold(
+            onSuccess = { reports ->
+                if (reports.isEmpty()) container.addView(views.emptyText("还没有测试记录。"))
+                else reports.forEach { container.addView(views.reportCard(it)) }
+            },
+            onFailure = { error ->
+                container.addView(views.emptyText(error.message ?: "暂时无法读取测试报告。"))
+            }
+        )
     }
 
     override fun onRequestPermissionsResult(

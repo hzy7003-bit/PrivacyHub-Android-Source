@@ -4,16 +4,19 @@ import android.content.Context
 import com.privacyhub.autofill.AppSigningCertificate
 import com.privacyhub.autofill.AutofillScopePolicy
 import com.privacyhub.data.db.PrivacyHubDatabaseProvider
+import com.privacyhub.data.db.DatabaseAccessCoordinator
 import com.privacyhub.data.db.entity.AutofillCredentialEntity
 import java.util.UUID
 
 class AutofillCredentialRepository(context: Context) {
     private val appContext = context.applicationContext
-    private val dao = PrivacyHubDatabaseProvider.get(appContext).autofillCredentialDao()
+    private val dao by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        PrivacyHubDatabaseProvider.get(appContext).autofillCredentialDao()
+    }
 
-    fun all(): List<AutofillCredentialEntity> = dao.all()
+    fun all(): List<AutofillCredentialEntity> = DatabaseAccessCoordinator.withDatabaseAccess { dao.all() }
 
-    fun getById(id: Long): AutofillCredentialEntity? = dao.getById(id)
+    fun getById(id: Long): AutofillCredentialEntity? = DatabaseAccessCoordinator.withDatabaseAccess { dao.getById(id) }
 
     fun save(label: String, username: String, password: String, packageName: String?, webDomain: String?): Long {
         val normalizedDomain = normalizeDomain(webDomain)
@@ -31,19 +34,21 @@ class AutofillCredentialRepository(context: Context) {
             "The selected app must be installed and its signing identity must be available."
         }
         val now = System.currentTimeMillis()
-        return dao.insert(
-            AutofillCredentialEntity(
-                backupId = UUID.randomUUID().toString(),
-                label = label.trim(),
-                username = username,
-                password = password,
-                packageName = normalizedPackageName,
-                webDomain = normalizedDomain,
-                packageSigningCertificateSha256 = signingCertificate,
-                createdAtMillis = now,
-                updatedAtMillis = now
+        return DatabaseAccessCoordinator.withDatabaseAccess {
+            dao.insert(
+                AutofillCredentialEntity(
+                    backupId = UUID.randomUUID().toString(),
+                    label = label.trim(),
+                    username = username,
+                    password = password,
+                    packageName = normalizedPackageName,
+                    webDomain = normalizedDomain,
+                    packageSigningCertificateSha256 = signingCertificate,
+                    createdAtMillis = now,
+                    updatedAtMillis = now
+                )
             )
-        )
+        }
     }
 
     fun update(
@@ -68,20 +73,22 @@ class AutofillCredentialRepository(context: Context) {
         require(normalizedPackageName == null || signingCertificate != null) {
             "The selected app must be installed and its signing identity must be available."
         }
-        dao.update(
-            existing.copy(
-                label = label.trim(),
-                username = username,
-                password = password,
-                packageName = normalizedPackageName,
-                webDomain = normalizedDomain,
-                packageSigningCertificateSha256 = signingCertificate,
-                updatedAtMillis = System.currentTimeMillis()
+        DatabaseAccessCoordinator.withDatabaseAccess {
+            dao.update(
+                existing.copy(
+                    label = label.trim(),
+                    username = username,
+                    password = password,
+                    packageName = normalizedPackageName,
+                    webDomain = normalizedDomain,
+                    packageSigningCertificateSha256 = signingCertificate,
+                    updatedAtMillis = System.currentTimeMillis()
+                )
             )
-        )
+        }
     }
 
-    fun delete(id: Long) = dao.deleteById(id)
+    fun delete(id: Long) = DatabaseAccessCoordinator.withDatabaseAccess { dao.deleteById(id) }
 
     private fun normalizeDomain(value: String?): String? {
         val trimmed = value?.trim()?.ifBlank { null } ?: return null

@@ -65,6 +65,8 @@ internal class BackupImportSession {
 internal object BackupImportReader {
     fun read(
         password: CharArray,
+        decrypt: (ByteArray, CharArray) -> ByteArray = EncryptedBackupCodec::decrypt,
+        decode: (ByteArray) -> BackupPayload = BackupPayloadCodec::decode,
         readEncryptedBackup: () -> ByteArray
     ): BackupImportReadResult {
         var encryptedBytes: ByteArray? = null
@@ -72,9 +74,9 @@ internal object BackupImportReader {
         return try {
             val encrypted = readEncryptedBackup()
             encryptedBytes = encrypted
-            val plain = EncryptedBackupCodec.decrypt(encrypted, password)
+            val plain = decrypt(encrypted, password)
             plainBytes = plain
-            BackupImportReadResult.Success(BackupPayloadCodec.decode(plain))
+            BackupImportReadResult.Success(decode(plain))
         } catch (_: BackupAuthenticationException) {
             BackupImportReadResult.AuthenticationFailed
         } catch (error: Exception) {

@@ -12,17 +12,26 @@ import android.widget.Toast
 import com.privacyhub.clipboard.SafeClipboard
 import com.privacyhub.pro.ProFeature
 import com.privacyhub.pro.ProLicenseStore
+import com.privacyhub.pro.ProLicenseCheck
 import com.privacyhub.presentation.security.SecureActivity
 import com.privacyhub.presentation.ui.ButtonKind
 import com.privacyhub.presentation.ui.FrostedUi
+import com.privacyhub.util.ActivityTaskScope
 
 class ProLicenseActivity : SecureActivity() {
-    private val licenseStore by lazy { ProLicenseStore(this) }
+    private val tasks by lazy { ActivityTaskScope(this) }
     private lateinit var licenseInput: EditText
     private lateinit var activationInput: EditText
+    private var operationInFlight = false
 
     override fun onUnlocked() {
+        if (operationInFlight) return
         render()
+    }
+
+    override fun onDestroy() {
+        tasks.close()
+        super.onDestroy()
     }
 
     private fun render() {
@@ -41,11 +50,56 @@ class ProLicenseActivity : SecureActivity() {
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val state = licenseStore.currentState()
-        val storedDataUnreadable = licenseStore.isStoredDataUnreadable(state)
-        content.addView(card(heading = statusHeading(state), body = buildStatusText(state)))
+        content.addView(TextView(this).apply {
+            text = "正在读取授权状态…"
+            textSize = 14f
+            setTextColor(FrostedUi.textSecondary)
+        })
+        root.addView(fullWidthButton("返回设置", ButtonKind.Secondary) { finish() })
+        setContentView(root)
 
-        val deviceCode = licenseStore.deviceCode().getOrNull()
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = {
+                val store = ProLicenseStore(app)
+                val state = store.currentState()
+                LicenseScreenState(state, store.isStoredDataUnreadable(state), store.deviceCode().getOrNull())
+            },
+            onResult = { owner, result -> (owner as ProLicenseActivity).renderState(result) }
+        )
+    }
+
+    private fun renderState(result: Result<LicenseScreenState>) {
+        val screenState = result.getOrElse { error ->
+            val root = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                FrostedUi.applyPageChrome(this)
+                addView(title("暂时无法读取 Pro 授权"))
+                addView(subtitle(error.message ?: "请稍后重试。"))
+                addView(fullWidthButton("重试", ButtonKind.Primary) { render() })
+                addView(fullWidthButton("返回设置", ButtonKind.Secondary) { finish() })
+            }
+            setContentView(root)
+            return
+        }
+        val state = screenState.license
+        val storedDataUnreadable = screenState.storedDataUnreadable
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            FrostedUi.applyPageChrome(this)
+        }
+        root.addView(title("Pro 授权"))
+        root.addView(subtitle("离线验证；只有你主动分享激活请求时，才会发送设备指纹哈希。"))
+        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val scroll = ScrollView(this)
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        content.addView(card(heading = statusHeading(state, storedDataUnreadable), body = buildStatusText(state)))
+
+        val deviceCode = screenState.deviceCode
         content.addView(sectionTitle("本机设备码"))
         content.addView(
             card(
@@ -133,14 +187,48 @@ class ProLicenseActivity : SecureActivity() {
     }
 
     private fun activateLicense() {
+        if (operationInFlight) return
         val text = licenseInput.text?.toString().orEmpty()
-        val result = licenseStore.activate(text)
-        Toast.makeText(this, result.message, Toast.LENGTH_SHORT).show()
-        render()
+        val app = applicationContext
+        operationInFlight = true
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { ProLicenseStore(app).activate(text) },
+            onResult = { owner, result ->
+                val activity = owner as ProLicenseActivity
+                activity.operationInFlight = false
+                result.fold(
+                    onSuccess = { check ->
+                        Toast.makeText(activity, check.message, Toast.LENGTH_SHORT).show()
+                        activity.render()
+                    },
+                    onFailure = { error -> activity.showOperationFailure(error) }
+                )
+            }
+        )
     }
 
     private fun shareActivationRequest() {
-        val result = licenseStore.createDeviceActivationRequest()
+        if (operationInFlight) return
+        operationInFlight = true
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { ProLicenseStore(app).createDeviceActivationRequest() },
+            onResult = { owner, result ->
+                val activity = owner as ProLicenseActivity
+                activity.operationInFlight = false
+                result.fold(
+                    onSuccess = { activationResult -> activity.showActivationRequest(activationResult) },
+                    onFailure = { error -> activity.showOperationFailure(error) }
+                )
+            }
+        )
+    }
+
+    private fun showActivationRequest(result: com.privacyhub.pro.DeviceActivationRequestResult) {
         val request = result.request
         if (!result.success || request == null) {
             Toast.makeText(this, result.message, Toast.LENGTH_SHORT).show()
@@ -187,10 +275,26 @@ class ProLicenseActivity : SecureActivity() {
     }
 
     private fun activateDevice() {
+        if (operationInFlight) return
         val text = activationInput.text?.toString().orEmpty()
-        val result = licenseStore.activateDevice(text)
-        Toast.makeText(this, result.message, Toast.LENGTH_SHORT).show()
-        render()
+        val app = applicationContext
+        operationInFlight = true
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { ProLicenseStore(app).activateDevice(text) },
+            onResult = { owner, result ->
+                val activity = owner as ProLicenseActivity
+                activity.operationInFlight = false
+                result.fold(
+                    onSuccess = { check ->
+                        Toast.makeText(activity, check.message, Toast.LENGTH_SHORT).show()
+                        activity.render()
+                    },
+                    onFailure = { error -> activity.showOperationFailure(error) }
+                )
+            }
+        )
     }
 
     private fun confirmRemoveDeviceBinding() {
@@ -199,13 +303,13 @@ class ProLicenseActivity : SecureActivity() {
             .setMessage("移除后，这台手机将不能使用此 License 的 Pro 功能。该操作不会自动释放开发者台账中的设备名额；重新绑定其它设备时，需要导入新的激活凭证。")
             .setNegativeButton("取消", null)
             .setPositiveButton("移除") { _, _ ->
-                val removed = licenseStore.removeDeviceActivation()
-                Toast.makeText(
-                    this,
-                    if (removed) "已移除本机设备绑定" else "移除失败，原有绑定数据已保留",
-                    Toast.LENGTH_SHORT
-                ).show()
-                render()
+                runLicenseMutation(
+                    task = { it.removeDeviceActivation() },
+                    onSuccess = { activity, removed ->
+                        Toast.makeText(activity, if (removed) "已移除本机设备绑定" else "移除失败，原有绑定数据已保留", Toast.LENGTH_SHORT).show()
+                        activity.render()
+                    }
+                )
             }
             .show()
     }
@@ -216,24 +320,54 @@ class ProLicenseActivity : SecureActivity() {
             .setMessage("只会移除这台手机保存的 License，不影响你手里的 License 文本。")
             .setNegativeButton("取消", null)
             .setPositiveButton("移除") { _, _ ->
-                val removed = licenseStore.clear()
-                Toast.makeText(
-                    this,
-                    if (removed) "已移除本机 License" else "移除失败，原有授权数据已保留",
-                    Toast.LENGTH_SHORT
-                ).show()
-                render()
+                runLicenseMutation(
+                    task = { it.clear() },
+                    onSuccess = { activity, removed ->
+                        Toast.makeText(activity, if (removed) "已移除本机 License" else "移除失败，原有授权数据已保留", Toast.LENGTH_SHORT).show()
+                        activity.render()
+                    }
+                )
             }
             .show()
     }
 
-    private fun statusHeading(state: com.privacyhub.pro.ProLicenseCheck): String {
+    private fun statusHeading(
+        state: com.privacyhub.pro.ProLicenseCheck,
+        storedDataUnreadable: Boolean
+    ): String {
         return when {
             state.active -> "Pro 已激活"
-            licenseStore.isStoredDataUnreadable(state) -> "Pro 授权数据不可读取"
+            storedDataUnreadable -> "Pro 授权数据不可读取"
             state.license?.requiresDeviceBinding == true -> "等待本机设备绑定"
             else -> "Pro 未激活"
         }
+    }
+
+    private fun runLicenseMutation(
+        task: (ProLicenseStore) -> Boolean,
+        onSuccess: (ProLicenseActivity, Boolean) -> Unit
+    ) {
+        if (operationInFlight) return
+        operationInFlight = true
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { task(ProLicenseStore(app)) },
+            onResult = { owner, result ->
+                val activity = owner as ProLicenseActivity
+                activity.operationInFlight = false
+                result.fold(onSuccess = { onSuccess(activity, it) }, onFailure = activity::showOperationFailure)
+            }
+        )
+    }
+
+    private fun showOperationFailure(error: Throwable) {
+        AlertDialog.Builder(this)
+            .setTitle("操作未完成")
+            .setMessage(error.message ?: "授权状态未更改，请重试。")
+            .setPositiveButton("知道了", null)
+            .show()
     }
 
     private fun card(heading: String, body: String): LinearLayout {
@@ -292,4 +426,10 @@ class ProLicenseActivity : SecureActivity() {
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private data class LicenseScreenState(
+        val license: ProLicenseCheck,
+        val storedDataUnreadable: Boolean,
+        val deviceCode: com.privacyhub.pro.DeviceCode?
+    )
 }

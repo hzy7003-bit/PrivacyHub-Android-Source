@@ -10,12 +10,18 @@ import com.privacyhub.data.repository.LocalStore
 import com.privacyhub.presentation.security.SecureActivity
 import com.privacyhub.presentation.ui.ButtonKind
 import com.privacyhub.presentation.ui.FrostedUi
+import com.privacyhub.util.ActivityTaskScope
 
 class MoreCategoriesActivity : SecureActivity() {
-    private val store by lazy { LocalStore(this) }
+    private val tasks by lazy { ActivityTaskScope(this) }
 
     override fun onUnlocked() {
         render()
+    }
+
+    override fun onDestroy() {
+        tasks.close()
+        super.onDestroy()
     }
 
     private fun render() {
@@ -34,7 +40,48 @@ class MoreCategoriesActivity : SecureActivity() {
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val categories = store.categories()
+        content.addView(TextView(this).apply {
+            text = "正在读取标签…"
+            textSize = 15f
+            setTextColor(FrostedUi.textSecondary)
+        })
+        root.addView(fullWidthButton("返回", ButtonKind.Secondary) { finish() })
+        setContentView(root)
+
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { LocalStore(app).categories() },
+            onResult = { owner, result -> (owner as MoreCategoriesActivity).renderCategories(result) }
+        )
+    }
+
+    private fun renderCategories(result: Result<List<String>>) {
+        val categories = result.getOrElse { error ->
+            setContentView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                FrostedUi.applyPageChrome(this)
+                addView(title("暂时无法读取标签"))
+                addView(subtitle(error.message ?: "原有数据未更改，请重试。"))
+                addView(fullWidthButton("重试", ButtonKind.Primary) { render() })
+                addView(fullWidthButton("返回", ButtonKind.Secondary) { finish() })
+            })
+            return
+        }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            FrostedUi.applyPageChrome(this)
+        }
+        root.addView(title("更多标签"))
+        root.addView(subtitle("这里显示所有分类标签，不包含收藏夹。"))
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(14), 0, 0)
+        }
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         if (categories.isEmpty()) {
             content.addView(TextView(this).apply {
                 text = "还没有标签。保存内容后会自动出现，也可以在设置里添加。"

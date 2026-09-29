@@ -2,6 +2,7 @@ package com.privacyhub.presentation.settings
 
 import android.content.Intent
 import android.widget.LinearLayout
+import java.lang.ref.WeakReference
 import android.widget.Toast
 import com.privacyhub.data.repository.LocalStore
 import com.privacyhub.data.settings.AppSettingsStore
@@ -24,6 +25,8 @@ import com.privacyhub.pro.ProLicenseStore
 import com.privacyhub.security.lock.AppLockSession
 import com.privacyhub.security.lock.SecureWindow
 import com.privacyhub.security.privacy.RecentsVisibility
+import com.privacyhub.util.AppExecutors
+import com.privacyhub.util.GenerationTaskGate
 
 internal class SettingsSectionsRenderer(
     private val activity: SettingsActivity,
@@ -35,6 +38,9 @@ internal class SettingsSectionsRenderer(
     private val lockNow: () -> Unit,
     private val writeDemoClipboard: () -> Unit
 ) {
+    private val reportGeneration = GenerationTaskGate()
+    private val proGeneration = GenerationTaskGate()
+
     fun render(content: LinearLayout) {
         renderCategories(content)
         renderDiagnostics(content)
@@ -89,32 +95,65 @@ internal class SettingsSectionsRenderer(
     }
 
     private fun renderPro(content: LinearLayout) {
+        val proContent = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+        }
         views.renderSection(content, "Pro") {
-            val state = proLicenses.currentState()
-            val license = state.license
-            val needsManagement = state.active || license != null
-            val body = when {
-                state.active && license != null -> {
-                    val features = if (license.allFeatures) "全部 Pro 功能" else license.features.joinToString("、") { it.label }
-                    "已离线激活。持有人：${license.holder}\n授权编号：${license.licenseId}\n已解锁：$features"
+            proContent.addView(views.emptyText("正在读取 Pro 授权…"))
+            content.addView(proContent)
+            val containerRef = WeakReference(proContent)
+            val rendererRef = WeakReference(this)
+            val gate = proGeneration
+            val generation = gate.next()
+            val licenseStore = proLicenses
+            AppExecutors.executeDiskResult(
+                task = { licenseStore.currentState() },
+                onResult = { result ->
+                    if (!gate.isCurrent(generation)) return@executeDiskResult
+                    val owner = rendererRef.get() ?: return@executeDiskResult
+                    val target = containerRef.get() ?: return@executeDiskResult
+                    if (owner.activity.isFinishing || owner.activity.isDestroyed) return@executeDiskResult
+                    owner.renderProState(target, result)
                 }
-                license?.requiresDeviceBinding == true ->
-                    "License 已保存，等待本机设备绑定。点击进入后分享本机激活请求，再导入开发者离线签发的设备激活凭证。"
-                else ->
-                    "离线 License 激活，不联网、不自动上传设备信息。需要设备绑定时，只有用户主动分享激活请求才会发送设备指纹哈希。"
-            }
+            )
+        }
+    }
+
+    private fun renderProState(content: LinearLayout, result: Result<com.privacyhub.pro.ProLicenseCheck>) {
+        content.removeAllViews()
+        val state = result.getOrElse { error ->
+            content.addView(views.emptyText(error.message ?: "暂时无法读取 Pro 授权状态。"))
             content.addView(views.card(
-                when {
-                    state.active -> "Pro 已激活"
-                    license?.requiresDeviceBinding == true -> "等待本机设备绑定"
-                    else -> "Pro 授权"
-                },
-                body,
-                views.button(
-                    if (needsManagement) "管理 Pro 授权" else "输入 License",
-                    if (needsManagement) ButtonKind.Secondary else ButtonKind.Primary
-                ) { open(ProLicenseActivity::class.java) }
+                "Pro 授权",
+                "离线 License 激活，不联网、不自动上传设备信息。",
+                views.button("管理 Pro 授权", ButtonKind.Secondary) { open(ProLicenseActivity::class.java) }
             ))
+            return
+        }
+        val license = state.license
+        val needsManagement = state.active || license != null
+        val body = when {
+            state.active && license != null -> {
+                val features = if (license.allFeatures) "全部 Pro 功能" else license.features.joinToString("、") { it.label }
+                "已离线激活。持有人：${license.holder}\n授权编号：${license.licenseId}\n已解锁：$features"
+            }
+            license?.requiresDeviceBinding == true ->
+                "License 已保存，等待本机设备绑定。点击进入后分享本机激活请求，再导入开发者离线签发的设备激活凭证。"
+            else ->
+                "离线 License 激活，不联网、不自动上传设备信息。需要设备绑定时，只有用户主动分享激活请求才会发送设备指纹哈希。"
+        }
+        content.addView(views.card(
+            when {
+                state.active -> "Pro 已激活"
+                license?.requiresDeviceBinding == true -> "等待本机设备绑定"
+                else -> "Pro 授权"
+            },
+            body,
+            views.button(
+                if (needsManagement) "管理 Pro 授权" else "输入 License",
+                if (needsManagement) ButtonKind.Secondary else ButtonKind.Primary
+            ) { open(ProLicenseActivity::class.java) }
+        ))
             content.addView(views.card(
                 "加密离线备份",
                 "Pro 可创建带独立口令的本地备份；恢复备份始终可用。备份不上传、不使用云端，也不会包含 Pro 授权或设备绑定。",
@@ -131,7 +170,6 @@ internal class SettingsSectionsRenderer(
                 views.button("管理网盘自动填码", ButtonKind.Secondary) { open(NetdiskAutomationSettingsActivity::class.java) }
             ))
         }
-    }
 
     private fun renderAppearance(content: LinearLayout) {
         views.renderSection(content, "外观") {
@@ -241,13 +279,27 @@ internal class SettingsSectionsRenderer(
     }
 
     private fun renderReports(content: LinearLayout) {
+        val reportContent = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+        }
         views.renderSection(content, "最近测试报告") {
-            val reports = store.recentReports(8)
-            if (reports.isEmpty()) {
-                content.addView(views.emptyText("还没有测试记录。"))
-            } else {
-                reports.forEach { content.addView(views.reportCard(it)) }
-            }
+            reportContent.addView(views.emptyText("正在读取测试报告…"))
+            content.addView(reportContent)
+            val localStore = store
+            val activityRef = WeakReference(activity)
+            val reportContentRef = WeakReference(reportContent)
+            val gate = reportGeneration
+            val generation = gate.next()
+            AppExecutors.executeDiskResult(
+                task = { localStore.recentReports(8) },
+                onResult = { result ->
+                    val owner = activityRef.get() ?: return@executeDiskResult
+                    val target = reportContentRef.get() ?: return@executeDiskResult
+                    if (!gate.isCurrent(generation)) return@executeDiskResult
+                    if (owner.isFinishing || owner.isDestroyed) return@executeDiskResult
+                    owner.renderRecentReports(target, result)
+                }
+            )
         }
     }
 

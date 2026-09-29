@@ -17,6 +17,7 @@ import com.privacyhub.presentation.SettingsActivity
 import com.privacyhub.presentation.notification.SaveNotificationManager
 import com.privacyhub.presentation.tile.SaveToVaultTileService
 import com.privacyhub.presentation.ui.ButtonKind
+import com.privacyhub.util.AppExecutors
 
 internal class SettingsEntryController(
     private val activity: SettingsActivity,
@@ -38,7 +39,7 @@ internal class SettingsEntryController(
         if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
             showSaveNotification()
         } else {
-            store.recordReport(
+            recordReportAsync(
                 entryPoint = EntryPoint.NOTIFICATION,
                 success = false,
                 failureReason = "POST_NOTIFICATIONS permission denied",
@@ -103,7 +104,7 @@ internal class SettingsEntryController(
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
-            store.recordReport(
+            recordReportAsync(
                 entryPoint = EntryPoint.NOTIFICATION,
                 success = false,
                 failureReason = "POST_NOTIFICATIONS permission missing",
@@ -116,7 +117,7 @@ internal class SettingsEntryController(
 
         settings.setPersistentNotificationEnabled(true)
         SaveNotificationManager(activity).showPersistentSaveNotification()
-        store.recordReport(EntryPoint.NOTIFICATION, true, null, null, "已请求显示常驻通知栏保存按钮")
+        recordReportAsync(EntryPoint.NOTIFICATION, true, null, null, "已请求显示常驻通知栏保存按钮")
         Toast.makeText(activity, "通知栏保存按钮已开启", Toast.LENGTH_SHORT).show()
         rerender()
     }
@@ -127,7 +128,7 @@ internal class SettingsEntryController(
             return
         }
         SaveNotificationManager(activity).cancel()
-        store.recordReport(EntryPoint.NOTIFICATION, true, null, null, "用户手动关闭常驻通知栏保存按钮")
+        recordReportAsync(EntryPoint.NOTIFICATION, true, null, null, "用户手动关闭常驻通知栏保存按钮")
         Toast.makeText(activity, "通知栏保存按钮已关闭", Toast.LENGTH_SHORT).show()
         rerender()
     }
@@ -135,7 +136,7 @@ internal class SettingsEntryController(
     private fun requestQuickSettingsTile() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
             showManualTileInstructions("当前 Android 版本不支持应用内直接请求添加磁贴。")
-            store.recordReport(
+            recordReportAsync(
                 EntryPoint.TILE,
                 false,
                 "requestAddTileService requires Android 13+",
@@ -148,7 +149,7 @@ internal class SettingsEntryController(
         val manager = activity.getSystemService(StatusBarManager::class.java)
         if (manager == null) {
             showManualTileInstructions("系统没有返回控制中心服务。")
-            store.recordReport(EntryPoint.TILE, false, "StatusBarManager unavailable", null, "需要用户手动编辑控制中心添加磁贴")
+            recordReportAsync(EntryPoint.TILE, false, "StatusBarManager unavailable", null, "需要用户手动编辑控制中心添加磁贴")
             return
         }
 
@@ -168,7 +169,7 @@ internal class SettingsEntryController(
             StatusBarManager.TILE_ADD_REQUEST_ERROR_APP_NOT_IN_FOREGROUND -> Triple(false, "请保持应用在前台后再试", "app not in foreground")
             else -> Triple(false, "系统拒绝添加控制中心按钮", "tile request result=$result")
         }
-        store.recordReport(EntryPoint.TILE, success, failure, null, message)
+        recordReportAsync(EntryPoint.TILE, success, failure, null, message)
         Toast.makeText(activity, message, Toast.LENGTH_SHORT).show()
         rerender()
     }
@@ -179,6 +180,19 @@ internal class SettingsEntryController(
             .setMessage("$reason\n\n请下拉控制中心，进入编辑按钮，找到“保存到安全箱”并拖到常用区域。")
             .setPositiveButton("知道了", null)
             .show()
+    }
+
+    private fun recordReportAsync(
+        entryPoint: EntryPoint,
+        success: Boolean,
+        failureReason: String?,
+        target: com.privacyhub.domain.model.LinkTarget?,
+        note: String
+    ) {
+        val localStore = store
+        AppExecutors.executeDisk {
+            runCatching { localStore.recordReport(entryPoint, success, failureReason, target, note) }
+        }
     }
 
     companion object {

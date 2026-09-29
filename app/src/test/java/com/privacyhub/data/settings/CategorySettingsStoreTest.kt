@@ -4,6 +4,7 @@ import com.privacyhub.security.keystore.KeystoreTextEncryptor
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -24,7 +25,7 @@ class CategorySettingsStoreTest {
     fun validEncryptedSnapshotIsReadWithoutBeingReplaced() {
         val snapshot = CategorySettingsSnapshot(
             customCategories = listOf("个人收藏"),
-            categoryAliases = mapOf("购物" to "消费"),
+            categoryAliases = mapOf("购物" to "个人收藏"),
             homeTags = listOf("购物")
         )
         val encoded = SensitiveSettingsCodec.encodeSnapshot(snapshot)
@@ -44,12 +45,14 @@ class CategorySettingsStoreTest {
     }
 
     @Test
-    fun unreadableEncryptedSnapshotUsesOnlyAnEphemeralReadFallback() {
+    fun unreadableEncryptedSnapshotFailsClosedForCategoryReferences() {
         val preferences = corruptPreferences()
         val store = categoryStore(preferences)
 
         assertEquals(emptyList(), store.customCategories())
-        assertEquals(AppSettingsStore.DEFAULT_HOME_TAGS, store.homeTags(AppSettingsStore.DEFAULT_CATEGORIES))
+        assertFailsWith<EncryptedSettingsUnavailableException> {
+            store.homeTags(AppSettingsStore.DEFAULT_CATEGORIES)
+        }
         assertNotNull(store.settingsReadError())
         assertEquals("old-cipher", preferences.getString(CIPHER_KEY, null))
         assertEquals("old-iv", preferences.getString(IV_KEY, null))
@@ -82,6 +85,56 @@ class CategorySettingsStoreTest {
     }
 
     @Test
+    fun danglingHomeTagIsSafelyRestoredAsCustomMetadata() {
+        val preferences = encryptedPreferences(
+            CategorySettingsSnapshot(emptyList(), emptyMap(), listOf("遗失的首页分类"))
+        )
+        val store = categoryStore(preferences)
+
+        assertEquals(listOf("遗失的首页分类"), store.homeTags(AppSettingsStore.DEFAULT_CATEGORIES))
+        assertTrue("遗失的首页分类" in store.customCategories())
+        assertEquals(
+            listOf("遗失的首页分类"),
+            store.portableBackupSettings(AppSettingsStore.DEFAULT_CATEGORIES).homeTags
+        )
+    }
+
+    @Test
+    fun danglingAliasDestinationIsSafelyRestoredAsCustomMetadata() {
+        val preferences = encryptedPreferences(
+            CategorySettingsSnapshot(emptyList(), mapOf("购物" to "遗失的分类"), emptyList())
+        )
+        val store = categoryStore(preferences)
+
+        val restored = store.portableBackupSettings(AppSettingsStore.DEFAULT_CATEGORIES)
+
+        assertEquals(mapOf("购物" to "遗失的分类"), restored.categoryAliases)
+        assertTrue("遗失的分类" in restored.customCategories)
+        assertFalse("遗失的分类" in store.homeTags(AppSettingsStore.DEFAULT_CATEGORIES))
+    }
+
+    @Test
+    fun aliasCannotBeCreatedForAnUnknownDestination() {
+        val store = categoryStore(MemorySharedPreferences())
+
+        assertFalse(store.setCategoryAlias("购物", "不存在的分类", AppSettingsStore.DEFAULT_CATEGORIES))
+    }
+
+    @Test
+    fun encryptedSettingsCommitFailureIsReturnedWithoutReplacingOldSnapshot() {
+        val original = CategorySettingsSnapshot(listOf("旧分类"), emptyMap(), listOf("旧分类"))
+        val preferences = encryptedPreferences(original).apply { successfulCommitsBeforeFailure = 1 }
+        val store = categoryStore(preferences)
+
+        assertFalse(store.removeCustomCategory("旧分类"))
+
+        assertEquals(
+            SensitiveSettingsCodec.encodeSnapshot(original),
+            preferences.getString(CIPHER_KEY, null)
+        )
+    }
+
+    @Test
     fun decoderRejectsMalformedNestedSectionsInsteadOfReturningAnEmptySnapshot() {
         val malformed = SensitiveSettingsCodec.encodeList(listOf("bad-list", "0;", "0;"))
 
@@ -92,6 +145,11 @@ class CategorySettingsStoreTest {
         putString(CIPHER_KEY, "old-cipher")
         putString(IV_KEY, "old-iv")
         putStringSet(LEGACY_CATEGORIES, setOf("保留标签"))
+    }
+
+    private fun encryptedPreferences(snapshot: CategorySettingsSnapshot) = MemorySharedPreferences().apply {
+        putString(CIPHER_KEY, SensitiveSettingsCodec.encodeSnapshot(snapshot))
+        putString(IV_KEY, "valid-iv")
     }
 
     private fun categoryStore(preferences: MemorySharedPreferences): CategorySettingsStore {

@@ -40,13 +40,14 @@ import com.privacyhub.presentation.ui.FrostedUi
 import com.privacyhub.presentation.ui.PorcelainViews
 import com.privacyhub.presentation.ui.UiMetrics
 import com.privacyhub.presentation.vault.VaultDetailActivity
-import com.privacyhub.util.AppExecutors
+import com.privacyhub.util.ActivityTaskScope
+import java.lang.ref.WeakReference
 
 class MainActivity : SecureActivity() {
     private val settingsStore by lazy { AppSettingsStore(this) }
     private val views by lazy { PorcelainViews(this) }
+    private val tasks by lazy { ActivityTaskScope(this) }
     private var selected = TRANSFER
-    private var generation = 0
     private var vaultScrollY = 0
     private var scroll: ScrollView? = null
     private var trialNoticeChecked = false
@@ -87,7 +88,7 @@ class MainActivity : SecureActivity() {
 
     override fun onPause() {
         if (selected == VAULT) vaultScrollY = scroll?.scrollY ?: vaultScrollY
-        generation++
+        tasks.invalidate()
         super.onPause()
     }
 
@@ -104,6 +105,7 @@ class MainActivity : SecureActivity() {
         inputDialog?.dismiss()
         addSheet?.setOnDismissListener(null)
         addSheet?.dismiss()
+        tasks.close()
         super.onDestroy()
     }
 
@@ -115,7 +117,7 @@ class MainActivity : SecureActivity() {
         }
         if (selected == VAULT) vaultScrollY = scroll?.scrollY ?: vaultScrollY
         selected = tab
-        generation++
+        tasks.invalidate()
         tabBack.isEnabled = selected == VAULT
         refreshSecureContent()
     }
@@ -170,7 +172,7 @@ class MainActivity : SecureActivity() {
     }
 
     private fun renderVault() {
-        val token = ++generation
+        val token = tasks.nextGeneration()
         val root = root()
         root.addView(views.title("安全箱"))
         val content = views.column()
@@ -215,53 +217,61 @@ class MainActivity : SecureActivity() {
         setContentView(root)
         scroll?.let { ViewCompat.requestApplyInsets(it) }
         val app = applicationContext
-        AppExecutors.executeDisk {
-            val result = runCatching {
+        val dataRef = WeakReference(data)
+        val createContentButtonRef = WeakReference(createContentButton)
+        val lockButtonRef = lockButton?.let(::WeakReference)
+        val scrollRef = scroll?.let(::WeakReference)
+        tasks.executeDisk(
+            generation = token,
+            task = {
                 val store = LocalStore(app)
                 Overview(store.favoriteItems(3), store.recentItems(3), store.homeTags())
-            }
-            AppExecutors.executeMain {
-                if (token != generation || selected != VAULT || isFinishing || isDestroyed) return@executeMain
-                data.removeAllViews()
+            },
+            onResult = { activity, result ->
+                val dataView = dataRef.get() ?: return@executeDisk
+                val createButton = createContentButtonRef.get() ?: return@executeDisk
+                val vaultScroll = scrollRef?.get() ?: return@executeDisk
+                if (activity.selected != VAULT) return@executeDisk
+                dataView.removeAllViews()
                 result.fold({ overview ->
-                    addFavoritesGroup(data, overview.favorites)
-                    addRecentGroup(data, overview.recent)
-                    data.addView(vaultSectionTitle("常用分类"))
-                    val categoriesSurface = moduleSurface()
+                    activity.addFavoritesGroup(dataView, overview.favorites)
+                    activity.addRecentGroup(dataView, overview.recent)
+                    dataView.addView(activity.vaultSectionTitle("常用分类"))
+                    val categoriesSurface = activity.moduleSurface()
                     overview.categories.forEachIndexed { index, category ->
                         if (index > 0) {
-                            categoriesSurface.addView(LinearLayout(this).apply {
+                            categoriesSurface.addView(LinearLayout(activity).apply {
                                 setBackgroundColor(FrostedUi.divider)
-                                layoutParams = LinearLayout.LayoutParams(-1, views.dp(1)).apply {
-                                    marginStart = views.dp(UiMetrics.Content)
-                                    marginEnd = views.dp(UiMetrics.Content)
+                                layoutParams = LinearLayout.LayoutParams(-1, activity.views.dp(1)).apply {
+                                    marginStart = activity.views.dp(UiMetrics.Content)
+                                    marginEnd = activity.views.dp(UiMetrics.Content)
                                 }
                             })
                         }
-                        categoriesSurface.addView(moduleActionRow(category) {
-                            openCategory(CategoryDetailActivity.MODE_CATEGORY, category)
+                        categoriesSurface.addView(activity.moduleActionRow(category) {
+                            activity.openCategory(CategoryDetailActivity.MODE_CATEGORY, category)
                         })
                     }
-                    categoriesSurface.addView(LinearLayout(this).apply {
+                    categoriesSurface.addView(LinearLayout(activity).apply {
                         setBackgroundColor(FrostedUi.divider)
-                        layoutParams = LinearLayout.LayoutParams(-1, views.dp(1)).apply {
-                            marginStart = views.dp(UiMetrics.Content)
-                            marginEnd = views.dp(UiMetrics.Content)
+                        layoutParams = LinearLayout.LayoutParams(-1, activity.views.dp(1)).apply {
+                            marginStart = activity.views.dp(UiMetrics.Content)
+                            marginEnd = activity.views.dp(UiMetrics.Content)
                         }
                     })
-                    categoriesSurface.addView(moduleActionRow("全部分类与管理") {
-                        startActivity(Intent(this, MoreCategoriesActivity::class.java))
+                    categoriesSurface.addView(activity.moduleActionRow("全部分类与管理") {
+                        activity.startActivity(Intent(activity, MoreCategoriesActivity::class.java))
                     })
-                    data.addView(categoriesSurface)
-                    scroll?.post { scroll?.scrollTo(0, vaultScrollY) }
+                    dataView.addView(categoriesSurface)
+                    vaultScroll.post { vaultScroll.scrollTo(0, activity.vaultScrollY) }
                 }, {
-                    data.addView(views.text("暂时无法读取安全箱。原有数据不会被清除。", muted = true))
-                    data.addView(views.button("重试") { renderVault() })
+                    dataView.addView(activity.views.text("暂时无法读取安全箱。原有数据不会被清除。", muted = true))
+                    dataView.addView(activity.views.button("重试") { activity.renderVault() })
                 })
-                createContentButton.visibility = android.view.View.VISIBLE
-                lockButton?.visibility = android.view.View.VISIBLE
+                createButton.visibility = android.view.View.VISIBLE
+                lockButtonRef?.get()?.visibility = android.view.View.VISIBLE
             }
-        }
+        )
     }
 
     private fun moduleSurface() = views.column().apply {

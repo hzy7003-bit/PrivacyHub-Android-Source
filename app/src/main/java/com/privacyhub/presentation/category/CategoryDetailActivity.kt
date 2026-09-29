@@ -16,12 +16,15 @@ import com.privacyhub.presentation.components.SavedItemCardFactory
 import com.privacyhub.presentation.security.SecureActivity
 import com.privacyhub.presentation.ui.ButtonKind
 import com.privacyhub.presentation.ui.FrostedUi
+import com.privacyhub.util.ActivityTaskScope
 
 class CategoryDetailActivity : SecureActivity() {
     private val store by lazy { LocalStore(this) }
     private val settingsStore by lazy { AppSettingsStore(this) }
+    private val tasks by lazy { ActivityTaskScope(this) }
     private var mode: String = MODE_CATEGORY
     private var category: String = ""
+    private var operationInFlight = false
 
     override fun onSecureCreate(savedInstanceState: android.os.Bundle?) {
         mode = intent.getStringExtra(EXTRA_MODE) ?: MODE_CATEGORY
@@ -29,7 +32,13 @@ class CategoryDetailActivity : SecureActivity() {
     }
 
     override fun onUnlocked() {
+        if (operationInFlight) return
         render()
+    }
+
+    override fun onDestroy() {
+        tasks.close()
+        super.onDestroy()
     }
 
     private fun render() {
@@ -40,10 +49,51 @@ class CategoryDetailActivity : SecureActivity() {
 
         root.addView(title(screenTitle()))
         root.addView(subtitle(screenSubtitle()))
-        if (mode == MODE_CATEGORY) {
-            root.addView(manageRow())
-        }
+        root.addView(TextView(this).apply {
+            text = "正在读取内容…"
+            textSize = 14f
+            setTextColor(FrostedUi.textSecondary)
+            setPadding(0, dp(14), 0, 0)
+        })
+        root.addView(fullWidthButton("返回", ButtonKind.Secondary) { finish() })
+        setContentView(root)
 
+        val requestedMode = mode
+        val requestedCategory = category
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = {
+                val localStore = LocalStore(app)
+                val items = when (requestedMode) {
+                    MODE_FAVORITES -> localStore.favoriteItems(limit = 100)
+                    MODE_RECENT -> localStore.recentItems(limit = 100)
+                    else -> localStore.categoryItems(requestedCategory, limit = 100)
+                }
+                CategoryContents(
+                    items = items,
+                    isSystemCategory = requestedMode == MODE_CATEGORY && localStore.isSystemCategory(requestedCategory)
+                )
+            },
+            onResult = { owner, result -> (owner as CategoryDetailActivity).renderContents(result) }
+        )
+    }
+
+    private fun renderContents(result: Result<CategoryContents>) {
+        val loaded = result.getOrElse { error ->
+            val root = pageRoot()
+            root.addView(title("暂时无法读取内容"))
+            root.addView(subtitle(error.message ?: "原有数据未更改，请重试。"))
+            root.addView(fullWidthButton("重试", ButtonKind.Primary) { render() })
+            root.addView(fullWidthButton("返回", ButtonKind.Secondary) { finish() })
+            setContentView(root)
+            return
+        }
+        val root = pageRoot()
+        root.addView(title(screenTitle()))
+        root.addView(subtitle(screenSubtitle()))
+        if (mode == MODE_CATEGORY) root.addView(manageRow(loaded.isSystemCategory))
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -52,7 +102,7 @@ class CategoryDetailActivity : SecureActivity() {
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val items = loadItems()
+        val items = loaded.items
         val heading = listHeading(items.size)
         content.addView(SavedItemCardFactory.sectionTitle(this, heading))
         if (items.isEmpty()) {
@@ -75,7 +125,12 @@ class CategoryDetailActivity : SecureActivity() {
         setContentView(root)
     }
 
-    private fun manageRow(): LinearLayout {
+    private fun pageRoot() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        FrostedUi.applyPageChrome(this)
+    }
+
+    private fun manageRow(isSystem: Boolean): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(12), 0, dp(4))
@@ -83,18 +138,9 @@ class CategoryDetailActivity : SecureActivity() {
                 showRenameDialog()
             })
             addView(space(dp(8), 1))
-            val isSystem = store.isSystemCategory(category)
             addView(rowButton(if (isSystem) "清空/整理内容" else "删除标签") {
                 showDeleteOrOrganizeOptions(isSystem)
             })
-        }
-    }
-
-    private fun loadItems(): List<SavedItem> {
-        return when (mode) {
-            MODE_FAVORITES -> store.favoriteItems(limit = 100)
-            MODE_RECENT -> store.recentItems(limit = 100)
-            else -> store.categoryItems(category, limit = 100)
         }
     }
 
@@ -143,57 +189,81 @@ class CategoryDetailActivity : SecureActivity() {
             .setTitle(title)
             .setItems(arrayOf(first, second, third)) { _, which ->
                 when (which) {
-                    0 -> moveToOtherAndMaybeRemoveTag(isSystem)
+                    0 -> moveToOtherAndMaybeRemoveTag()
                     1 -> confirmDeleteItemsAndMaybeRemoveTag(isSystem)
-                    2 -> chooseTargetCategory(isSystem)
+                    2 -> chooseTargetCategory()
                 }
             }
             .show()
     }
 
-    private fun moveToOtherAndMaybeRemoveTag(isSystem: Boolean) {
-        val count = store.moveCategory(category, "其他")
-        if (!isSystem) {
-            store.deleteCustomCategory(category)
-        }
-        Toast.makeText(this, "已移入“其他”：$count 条", Toast.LENGTH_SHORT).show()
-        finish()
+    private fun moveToOtherAndMaybeRemoveTag() {
+        val app = applicationContext
+        val source = category
+        runMutation(
+            task = { LocalStore(app).let { localStore ->
+                localStore.moveCategoryAndRemoveCustomSource(source, "其他")
+            } },
+            onSuccess = { activity, count ->
+                Toast.makeText(activity, "已移入“其他”：$count 条", Toast.LENGTH_SHORT).show()
+                activity.finish()
+            }
+        )
     }
 
     private fun confirmDeleteItemsAndMaybeRemoveTag(isSystem: Boolean) {
-        val count = store.countByCategory(category)
+        if (operationInFlight) return
+        val app = applicationContext
+        val source = category
+        runQuery(
+            task = { LocalStore(app).countByCategory(source) },
+            onSuccess = { activity, count -> activity.showConfirmDeleteItems(count, isSystem) }
+        )
+    }
+
+    private fun showConfirmDeleteItems(count: Int, isSystem: Boolean) {
+        val source = category
         AlertDialog.Builder(this)
             .setTitle("确认删除内容")
-            .setMessage("将删除“$category”中的 $count 条内容，此操作不可恢复。")
+            .setMessage("将删除“$source”中的 $count 条内容，此操作不可恢复。")
             .setNegativeButton("取消", null)
             .setPositiveButton("确认删除内容") { _, _ ->
-                val deleted = store.deleteCategoryItems(category)
-                if (!isSystem) {
-                    store.deleteCustomCategory(category)
-                }
-                Toast.makeText(this, "已删除 $deleted 条内容", Toast.LENGTH_SHORT).show()
-                finish()
+                val app = applicationContext
+                runMutation(
+                    task = { LocalStore(app).let { localStore ->
+                        localStore.deleteCategoryItemsAndMaybeRemoveCustomCategory(source, removeCustomCategory = !isSystem)
+                    } },
+                    onSuccess = { activity, deleted ->
+                        Toast.makeText(activity, "已删除 $deleted 条内容", Toast.LENGTH_SHORT).show()
+                        activity.finish()
+                    }
+                )
             }
             .show()
     }
 
-    private fun chooseTargetCategory(isSystem: Boolean) {
-        val categories = store.categories().filterNot { it == category }
+    private fun chooseTargetCategory() {
+        val app = applicationContext
+        val source = category
+        runQuery(
+            task = { LocalStore(app).categories().filterNot { it == source } },
+            onSuccess = { activity, categories -> activity.showTargetCategories(categories) }
+        )
+    }
+
+    private fun showTargetCategories(categories: List<String>) {
         val options = (categories + "创建新标签").toTypedArray()
         AlertDialog.Builder(this)
             .setTitle("移入哪个标签")
             .setItems(options) { _, which ->
                 val selected = options[which]
-                if (selected == "创建新标签") {
-                    showMoveToNewCategoryDialog(isSystem)
-                } else {
-                    moveToCategory(selected, isSystem)
-                }
+                if (selected == "创建新标签") showMoveToNewCategoryDialog()
+                else moveToCategory(selected)
             }
             .show()
     }
 
-    private fun showMoveToNewCategoryDialog(isSystem: Boolean) {
+    private fun showMoveToNewCategoryDialog() {
         val input = EditText(this).apply {
             hint = "新标签名称"
             setSingleLine(true)
@@ -208,19 +278,24 @@ class CategoryDetailActivity : SecureActivity() {
                 if (target.isBlank()) {
                     Toast.makeText(this, "标签名不能为空", Toast.LENGTH_SHORT).show()
                 } else {
-                    moveToCategory(target, isSystem)
+                    moveToCategory(target)
                 }
             }
             .show()
     }
 
-    private fun moveToCategory(target: String, isSystem: Boolean) {
-        val count = store.moveCategory(category, target)
-        if (!isSystem) {
-            store.deleteCustomCategory(category)
-        }
-        Toast.makeText(this, "已移动 $count 条内容", Toast.LENGTH_SHORT).show()
-        finish()
+    private fun moveToCategory(target: String) {
+        val app = applicationContext
+        val source = category
+        runMutation(
+            task = { LocalStore(app).let { localStore ->
+                localStore.moveCategoryAndRemoveCustomSource(source, target)
+            } },
+            onSuccess = { activity, count ->
+                Toast.makeText(activity, "已移动 $count 条内容", Toast.LENGTH_SHORT).show()
+                activity.finish()
+            }
+        )
     }
 
     private fun showRenameDialog() {
@@ -240,11 +315,40 @@ class CategoryDetailActivity : SecureActivity() {
                     Toast.makeText(this, "标签名不能为空", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
-                store.renameCategory(category, newName)
-                Toast.makeText(this, "已重命名", Toast.LENGTH_SHORT).show()
-                category = newName
-                render()
+                val app = applicationContext
+                val source = category
+                runMutation(
+                    task = { LocalStore(app).renameCategory(source, newName) },
+                    onSuccess = { activity, _ ->
+                        activity.category = newName
+                        Toast.makeText(activity, "已重命名", Toast.LENGTH_SHORT).show()
+                        activity.render()
+                    }
+                )
             }
+            .show()
+    }
+
+    private fun <R> runQuery(task: () -> R, onSuccess: (CategoryDetailActivity, R) -> Unit) {
+        if (operationInFlight) return
+        operationInFlight = true
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(generation, task, onResult = { owner, result ->
+            val activity = owner as CategoryDetailActivity
+            activity.operationInFlight = false
+            result.fold(onSuccess = { onSuccess(activity, it) }, onFailure = activity::showOperationFailure)
+        })
+    }
+
+    private fun <R> runMutation(task: () -> R, onSuccess: (CategoryDetailActivity, R) -> Unit) {
+        runQuery(task, onSuccess)
+    }
+
+    private fun showOperationFailure(error: Throwable) {
+        AlertDialog.Builder(this)
+            .setTitle("操作未完成")
+            .setMessage(error.message ?: "原有数据未更改，请重试。")
+            .setPositiveButton("知道了", null)
             .show()
     }
 
@@ -287,6 +391,11 @@ class CategoryDetailActivity : SecureActivity() {
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private data class CategoryContents(
+        val items: List<SavedItem>,
+        val isSystemCategory: Boolean
+    )
 
     companion object {
         const val EXTRA_MODE = "mode"

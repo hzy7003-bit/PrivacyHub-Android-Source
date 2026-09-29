@@ -6,19 +6,27 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.lang.ref.WeakReference
 import com.privacyhub.diagnostics.DiagnosticReport
 import com.privacyhub.diagnostics.DiagnosticReportBuilder
 import com.privacyhub.presentation.security.SecureActivity
 import com.privacyhub.presentation.ui.ButtonKind
 import com.privacyhub.presentation.ui.FrostedUi
+import com.privacyhub.util.ActivityTaskScope
 
 class DiagnosticsActivity : SecureActivity() {
+    private val tasks by lazy { ActivityTaskScope(this) }
+
     override fun onUnlocked() {
         render()
     }
 
+    override fun onDestroy() {
+        tasks.close()
+        super.onDestroy()
+    }
+
     private fun render() {
-        val report = DiagnosticReportBuilder(this).build()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             FrostedUi.applyPageChrome(this)
@@ -34,11 +42,38 @@ class DiagnosticsActivity : SecureActivity() {
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        renderReport(content, report)
+        content.addView(TextView(this).apply {
+            text = "正在生成诊断报告…"
+            textSize = 14f
+            setTextColor(FrostedUi.textSecondary)
+        })
         root.addView(fullWidthButton("返回设置", ButtonKind.Secondary) {
             finish()
         })
         setContentView(root)
+
+        val app = applicationContext
+        val contentRef = WeakReference(content)
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { DiagnosticReportBuilder(app).build() },
+            onResult = { owner, result ->
+                val activity = owner as DiagnosticsActivity
+                val target = contentRef.get() ?: return@executeDisk
+                target.removeAllViews()
+                result.fold(
+                    onSuccess = { report -> activity.renderReport(target, report) },
+                    onFailure = { error ->
+                        target.addView(TextView(activity).apply {
+                            text = error.message ?: "暂时无法生成诊断报告。"
+                            textSize = 14f
+                            setTextColor(FrostedUi.textSecondary)
+                        })
+                    }
+                )
+            }
+        )
     }
 
     private fun renderReport(content: LinearLayout, report: DiagnosticReport) {

@@ -20,7 +20,8 @@ internal class CategorySettingsStore(
     }
 
     fun allKnownCategories(dbCategories: List<String>): List<String> {
-        return (DEFAULT_CATEGORIES + customCategories() + dbCategories)
+        val current = normalizedReferences(dbCategories)
+        return (DEFAULT_CATEGORIES + current.customCategories + dbCategories)
             .mapNotNull(::normalizeCategoryName)
             .distinct()
     }
@@ -31,32 +32,43 @@ internal class CategorySettingsStore(
         val current = snapshot()
         val next = current.customCategories.toMutableSet()
         if (!next.add(normalized)) return false
-        return save(current.copy(customCategories = next.sorted()))
+        persistOrThrow(current.copy(customCategories = next.sorted()), "无法保存自定义分类。")
+        return true
     }
 
-    fun removeCustomCategory(name: String) {
-        val normalized = normalizeCategoryName(name) ?: return
-        if (isSystemCategory(normalized)) return
+    fun removeCustomCategory(name: String): Boolean {
+        val normalized = normalizeCategoryName(name) ?: return false
+        if (isSystemCategory(normalized)) return true
         val current = snapshot()
-        save(
+        return save(
             current.copy(
                 customCategories = current.customCategories.filterNot { it == normalized },
-                categoryAliases = current.categoryAliases.filterValues { it != normalized },
+                categoryAliases = current.categoryAliases.filterKeys { it != normalized }.filterValues { it != normalized },
                 homeTags = current.homeTags.filterNot { it == normalized }
             )
         )
     }
 
-    fun renameCustomCategory(oldName: String, newName: String) {
-        val old = normalizeCategoryName(oldName) ?: return
-        val new = normalizeCategoryName(newName) ?: return
-        if (isSystemCategory(old) || isSystemCategory(new)) return
+    fun renameCustomCategory(oldName: String, newName: String): Boolean {
+        val old = normalizeCategoryName(oldName) ?: return false
+        val new = normalizeCategoryName(newName) ?: return false
+        if (isSystemCategory(old)) return false
         val current = snapshot()
-        val categories = current.customCategories.filterNot { it == old }.toMutableSet().apply { add(new) }
-        save(
+        val categories = current.customCategories.filterNot { it == old }.toMutableSet()
+        if (!isSystemCategory(new)) categories.add(new)
+        val aliases = linkedMapOf<String, String>()
+        current.categoryAliases.forEach { (source, destination) ->
+            val renamedSource = if (source == old) new else source
+            val renamedDestination = if (destination == old) new else destination
+            val previousDestination = aliases.putIfAbsent(renamedSource, renamedDestination)
+            if (previousDestination != null && previousDestination != renamedDestination) {
+                throw EncryptedSettingsUnavailableException("分类别名存在冲突，管理操作已停用。")
+            }
+        }
+        return save(
             current.copy(
                 customCategories = categories.sorted(),
-                categoryAliases = current.categoryAliases.mapValues { (_, value) -> if (value == old) new else value },
+                categoryAliases = aliases,
                 homeTags = current.homeTags.map { if (it == old) new else it }.distinct()
             )
         )
@@ -67,11 +79,12 @@ internal class CategorySettingsStore(
         return readableSnapshotOrDefault().categoryAliases[normalized] ?: normalized
     }
 
-    fun setCategoryAlias(systemCategory: String, userCategory: String) {
-        val system = normalizeCategoryName(systemCategory) ?: return
-        val user = normalizeCategoryName(userCategory) ?: return
+    fun setCategoryAlias(systemCategory: String, userCategory: String, dbCategories: List<String>): Boolean {
+        val system = normalizeCategoryName(systemCategory) ?: return false
+        val user = normalizeCategoryName(userCategory) ?: return false
+        if (!isSystemCategory(system) || user !in allKnownCategories(dbCategories)) return false
         val current = snapshot()
-        save(current.copy(categoryAliases = current.categoryAliases + (system to user)))
+        return save(current.copy(categoryAliases = current.categoryAliases + (system to user)))
     }
 
     fun normalizeCategoryForStorage(category: String?): String? = category?.let(::normalizeCategoryName)
@@ -91,8 +104,9 @@ internal class CategorySettingsStore(
     }
 
     fun homeTags(dbCategories: List<String>): List<String> {
-        val known = allKnownCategories(dbCategories).toSet()
-        val stored = readableSnapshotOrDefault().homeTags
+        val current = normalizedReferences(dbCategories)
+        val known = (DEFAULT_CATEGORIES + current.customCategories + dbCategories).toSet()
+        val stored = current.homeTags
         val candidates = if (stored.isEmpty()) DEFAULT_HOME_TAGS else stored
         return candidates
             .mapNotNull(::normalizeCategoryName)
@@ -101,25 +115,29 @@ internal class CategorySettingsStore(
             .take(MAX_HOME_TAGS)
     }
 
-    fun setHomeTags(tags: List<String>) {
+    fun setHomeTags(tags: List<String>): Boolean {
         val next = tags.mapNotNull(::normalizeCategoryName).distinct().take(MAX_HOME_TAGS)
         val current = snapshot()
-        save(current.copy(homeTags = next))
+        val categories = (current.customCategories + next.filterNot(::isSystemCategory)).distinct().sorted()
+        return save(current.copy(customCategories = categories, homeTags = next))
     }
 
     fun addHomeTag(category: String, dbCategories: List<String>): Boolean {
         val normalized = normalizeCategoryName(category) ?: return false
+        val known = allKnownCategories(dbCategories).toSet()
+        if (normalized !in known) return false
         val next = homeTags(dbCategories).toMutableList()
         if (normalized in next || next.size >= MAX_HOME_TAGS) return false
         next.add(normalized)
         val current = snapshot()
-        return save(current.copy(homeTags = next))
+        persistOrThrow(current.copy(homeTags = next), "无法保存首页分类。")
+        return true
     }
 
-    fun removeHomeTag(category: String) {
-        val normalized = normalizeCategoryName(category) ?: return
+    fun removeHomeTag(category: String): Boolean {
+        val normalized = normalizeCategoryName(category) ?: return false
         val current = snapshot()
-        save(current.copy(homeTags = current.homeTags.filterNot { it == normalized }))
+        return save(current.copy(homeTags = current.homeTags.filterNot { it == normalized }))
     }
 
     fun moveHomeTag(category: String, direction: Int, dbCategories: List<String>): Boolean {
@@ -130,21 +148,25 @@ internal class CategorySettingsStore(
         if (index < 0 || newIndex !in next.indices) return false
         val moved = next.removeAt(index)
         next.add(newIndex, moved)
-        return save(snapshot().copy(homeTags = next))
+        persistOrThrow(snapshot().copy(homeTags = next), "无法调整首页分类顺序。")
+        return true
     }
 
     fun portableBackupSettings(dbCategories: List<String>): PortableBackupSettings {
-        val current = snapshot()
+        val current = normalizedReferences(dbCategories)
+        val known = (DEFAULT_CATEGORIES + current.customCategories + dbCategories).toSet()
+        val tags = if (current.homeTags.isEmpty()) DEFAULT_HOME_TAGS else current.homeTags
         return PortableBackupSettings(
-            customCategories = customCategories(),
+            customCategories = current.customCategories,
             categoryAliases = current.categoryAliases,
-            homeTags = homeTags(dbCategories)
+            homeTags = tags.filter { it in known }.take(MAX_HOME_TAGS)
         )
     }
 
     fun mergePortableBackupSettings(backup: PortableBackupSettings): Boolean {
-        val current = snapshot()
-        val categories = (current.customCategories + backup.customCategories)
+        val current = normalizedReferences(emptyList())
+        val categories = (current.customCategories + current.categoryAliases.values + current.homeTags +
+            backup.customCategories + backup.categoryAliases.values + backup.homeTags)
             .mapNotNull(::normalizeCategoryName)
             .filterNot(::isSystemCategory)
             .distinct()
@@ -166,7 +188,7 @@ internal class CategorySettingsStore(
     }
 
     fun replacePortableBackupSettings(backup: PortableBackupSettings): Boolean {
-        val categories = backup.customCategories
+        val categories = (backup.customCategories + backup.categoryAliases.values + backup.homeTags)
             .mapNotNull(::normalizeCategoryName)
             .filterNot(::isSystemCategory)
             .distinct()
@@ -223,6 +245,39 @@ internal class CategorySettingsStore(
             ?: throw EncryptedSettingsUnavailableException("本地分类设置内容格式无效。")
     }
 
+    /** Restores valid dangling references as custom metadata instead of silently dropping them. */
+    private fun normalizedReferences(dbCategories: List<String>): CategorySettingsSnapshot {
+        val current = snapshot()
+        val custom = current.customCategories
+            .map(::normalizeStoredCategoryName)
+            .filterNot(::isSystemCategory)
+            .toMutableSet()
+        val aliases = linkedMapOf<String, String>()
+        current.categoryAliases.forEach { (sourceName, destinationName) ->
+            val source = normalizeStoredCategoryName(sourceName)
+            val destination = normalizeStoredCategoryName(destinationName)
+            val previousDestination = aliases.putIfAbsent(source, destination)
+            if (previousDestination != null && previousDestination != destination) {
+                throw EncryptedSettingsUnavailableException("分类别名存在冲突，管理操作已停用。")
+            }
+            if (!isSystemCategory(destination) && destination !in dbCategories) custom.add(destination)
+        }
+        if (current.homeTags.size > MAX_HOME_TAGS) {
+            throw EncryptedSettingsUnavailableException("首页分类设置数量无效，管理操作已停用。")
+        }
+        val tags = current.homeTags.map(::normalizeStoredCategoryName).distinct()
+        tags.filterNot(::isSystemCategory).filterNot(dbCategories::contains).forEach(custom::add)
+        val normalized = CategorySettingsSnapshot(
+            customCategories = custom.sorted(),
+            categoryAliases = aliases,
+            homeTags = tags
+        )
+        if (normalized != current && !save(normalized)) {
+            throw EncryptedSettingsWriteException("无法修复分类引用，管理操作已停用。")
+        }
+        return normalized
+    }
+
     private fun readableSnapshotOrDefault(): CategorySettingsSnapshot =
         try {
             snapshot()
@@ -270,6 +325,10 @@ internal class CategorySettingsStore(
         return encryptedStore.write(ENCRYPTED_SNAPSHOT_KEY, SensitiveSettingsCodec.encodeSnapshot(snapshot))
     }
 
+    private fun persistOrThrow(snapshot: CategorySettingsSnapshot, message: String) {
+        if (!save(snapshot)) throw EncryptedSettingsWriteException(message)
+    }
+
     private fun normalizeHomeTags(tags: List<String>): List<String> {
         return tags.mapNotNull(::normalizeCategoryName).distinct().take(MAX_HOME_TAGS)
     }
@@ -278,6 +337,15 @@ internal class CategorySettingsStore(
         val trimmed = name.trim().take(MAX_CATEGORY_NAME_LENGTH)
         if (trimmed.isBlank()) return null
         return if (trimmed == LEGACY_CATEGORY_TOKEN) CATEGORY_PASSWORD else trimmed
+    }
+
+    private fun normalizeStoredCategoryName(name: String): String {
+        val trimmed = name.trim()
+        if (trimmed.isBlank() || trimmed.length > MAX_CATEGORY_NAME_LENGTH) {
+            throw EncryptedSettingsUnavailableException("分类设置内容无效，管理操作已停用。")
+        }
+        return normalizeCategoryName(trimmed)
+            ?: throw EncryptedSettingsUnavailableException("分类设置内容无效，管理操作已停用。")
     }
 
     companion object {

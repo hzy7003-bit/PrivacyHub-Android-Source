@@ -8,6 +8,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import java.lang.ref.WeakReference
 import com.privacyhub.data.repository.LocalStore
 import com.privacyhub.data.settings.AppSettingsStore
 import com.privacyhub.domain.model.LinkTarget
@@ -18,6 +19,7 @@ import com.privacyhub.presentation.vault.VaultDetailActivity
 import com.privacyhub.router.AppIntentRouter
 import com.privacyhub.router.OpenResult
 import com.privacyhub.util.Formatters
+import com.privacyhub.util.AppExecutors
 
 object SavedItemCardFactory {
     fun create(
@@ -59,10 +61,14 @@ object SavedItemCardFactory {
                 setPadding(0, dp(activity, 8), 0, 0)
             }
             val firstRow = actionRow(activity)
-            firstRow.addView(rowButton(activity, if (item.favorite) "取消收藏" else "收藏") {
-                store.setFavorite(item.id, !item.favorite)
-                onChanged()
-            })
+            val favoriteButton = rowButton(activity, if (item.favorite) "取消收藏" else "收藏") {}
+            favoriteButton.setOnClickListener {
+                if (favoriteButton.isEnabled) {
+                    favoriteButton.isEnabled = false
+                    updateFavoriteAsync(activity, store, item.id, !item.favorite, onChanged, favoriteButton)
+                }
+            }
+            firstRow.addView(favoriteButton)
             if (canOpenTarget(item)) {
                 firstRow.addView(space(activity, dp(activity, 8), 1))
                 firstRow.addView(rowButton(activity, openButtonLabel(item.primaryUrl, item.target), ButtonKind.Primary) {
@@ -109,13 +115,14 @@ object SavedItemCardFactory {
 
     private fun openSavedLink(activity: Activity, store: LocalStore, item: SavedItem) {
         val result = AppIntentRouter.openTargetAppThenFallback(activity, item.primaryUrl, item.target, item.originalText)
-        store.recordReport(
-            entryPoint = item.entryPoint,
-            success = result.success,
-            failureReason = result.failureReason,
-            target = item.target,
-            note = result.routeNote ?: "从列表页打开已保存链接"
-        )
+        val entryPoint = item.entryPoint
+        val target = item.target
+        val success = result.success
+        val failure = result.failureReason
+        val note = result.routeNote ?: "从列表页打开已保存链接"
+        AppExecutors.executeDisk {
+            runCatching { store.recordReport(entryPoint, success, failure, target, note) }
+        }
         Toast.makeText(activity, toastForOpenResult(result), Toast.LENGTH_SHORT).show()
     }
 
@@ -152,10 +159,59 @@ object SavedItemCardFactory {
             .setMessage("确定删除“${item.title.ifBlank { item.target.displayName }}”？此操作只删除本地安全箱记录。")
             .setNegativeButton("取消", null)
             .setPositiveButton("删除") { _, _ ->
-                store.deleteItem(item.id)
-                Toast.makeText(activity, "已删除", Toast.LENGTH_SHORT).show()
-                onChanged()
+                val itemId = item.id
+                val weakActivity = WeakReference(activity)
+                val weakChanged = WeakReference(onChanged)
+                AppExecutors.executeDiskResult(
+                    task = { store.deleteItem(itemId) },
+                    onResult = { result ->
+                        val owner = weakActivity.get() ?: return@executeDiskResult
+                        if (owner.isFinishing || owner.isDestroyed) return@executeDiskResult
+                        result.fold(
+                            {
+                                Toast.makeText(owner, "已删除", Toast.LENGTH_SHORT).show()
+                                weakChanged.get()?.invoke()
+                            },
+                            { error -> showOperationFailure(owner, error) }
+                        )
+                    }
+                )
             }
+            .show()
+    }
+
+    private fun updateFavoriteAsync(
+        activity: Activity,
+        store: LocalStore,
+        itemId: Long,
+        favorite: Boolean,
+        onChanged: () -> Unit,
+        button: Button
+    ) {
+        val weakActivity = WeakReference(activity)
+        val weakChanged = WeakReference(onChanged)
+        val weakButton = WeakReference(button)
+        AppExecutors.executeDiskResult(
+            task = { store.setFavorite(itemId, favorite) },
+            onResult = { result ->
+                val owner = weakActivity.get() ?: return@executeDiskResult
+                if (owner.isFinishing || owner.isDestroyed) return@executeDiskResult
+                result.fold(
+                    { weakChanged.get()?.invoke() },
+                    { error ->
+                        weakButton.get()?.isEnabled = true
+                        showOperationFailure(owner, error)
+                    }
+                )
+            }
+        )
+    }
+
+    private fun showOperationFailure(activity: Activity, error: Throwable) {
+        AlertDialog.Builder(activity)
+            .setTitle("操作未完成")
+            .setMessage(error.message ?: "原有数据未更改，请重试。")
+            .setPositiveButton("知道了", null)
             .show()
     }
 

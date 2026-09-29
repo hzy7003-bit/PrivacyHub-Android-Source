@@ -26,10 +26,17 @@ import com.privacyhub.pro.ProFeature
 import com.privacyhub.pro.ProGate
 import com.privacyhub.router.BrowserFallback
 import com.privacyhub.security.lock.SecureWindow
+import com.privacyhub.util.ActivityTaskScope
 import com.privacyhub.util.AppExecutors
 
 class NotificationEntryActivity : Activity() {
+    private val tasks by lazy { ActivityTaskScope(this) }
     private var handled = false
+
+    override fun onDestroy() {
+        tasks.close()
+        super.onDestroy()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,16 +76,16 @@ class NotificationEntryActivity : Activity() {
                 text = text,
                 entryPoint = entryPoint,
                 successDiagnosticNote = DiagnosticNotePolicy.saveSucceeded(entryPoint)
-            ) { saveResult ->
+            ) { activity, saveResult ->
                 saveResult.fold(
                     onSuccess = {
-                        if (!isActivityUnavailable()) {
-                            Toast.makeText(this, "已保存到安全箱", Toast.LENGTH_SHORT).show()
-                            closeNotificationTask()
+                        if (!activity.isActivityUnavailable()) {
+                            Toast.makeText(activity, "已保存到安全箱", Toast.LENGTH_SHORT).show()
+                            activity.closeNotificationTask()
                         }
                     },
                     onFailure = { error ->
-                        if (!isActivityUnavailable()) handleSaveFailure(error)
+                        if (!activity.isActivityUnavailable()) activity.handleSaveFailure(error)
                     }
                 )
             }
@@ -89,13 +96,13 @@ class NotificationEntryActivity : Activity() {
                 failureReason = result.failureReason,
                 target = LinkTarget.UNKNOWN,
                 note = failureNote
-            ) { reportResult ->
-                if (!isActivityUnavailable()) {
+            ) { activity, reportResult ->
+                if (!activity.isActivityUnavailable()) {
                     if (reportResult.exceptionOrNull() is VaultDatabaseUnavailableException) {
-                        showDatabaseUnavailable()
+                        activity.showDatabaseUnavailable()
                     } else {
-                        Toast.makeText(this, "读取剪切板失败", Toast.LENGTH_SHORT).show()
-                        closeNotificationTask()
+                        Toast.makeText(activity, "读取剪切板失败", Toast.LENGTH_SHORT).show()
+                        activity.closeNotificationTask()
                     }
                 }
             }
@@ -111,13 +118,13 @@ class NotificationEntryActivity : Activity() {
                 failureReason = result.failureReason,
                 target = LinkTarget.UNKNOWN,
                 note = "通知栏打开链接按钮读取剪切板失败"
-            ) { reportResult ->
-                if (!isActivityUnavailable()) {
+            ) { activity, reportResult ->
+                if (!activity.isActivityUnavailable()) {
                     if (reportResult.exceptionOrNull() is VaultDatabaseUnavailableException) {
-                        showDatabaseUnavailable()
+                        activity.showDatabaseUnavailable()
                     } else {
-                        Toast.makeText(this, "读取剪切板失败", Toast.LENGTH_SHORT).show()
-                        closeNotificationTask()
+                        Toast.makeText(activity, "读取剪切板失败", Toast.LENGTH_SHORT).show()
+                        activity.closeNotificationTask()
                     }
                 }
             }
@@ -126,7 +133,10 @@ class NotificationEntryActivity : Activity() {
 
         val text = result.text.orEmpty()
         val app = applicationContext
-        AppExecutors.executeDiskResult({
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = {
             val store = LocalStore(app)
             val target = LinkTargetDetector.detect(text)
             val url = LinkParser.extractFirstUrl(text)
@@ -138,47 +148,16 @@ class NotificationEntryActivity : Activity() {
                 target = target
             )
             ClipboardSnapshot(text = text, url = url, target = target)
-        }) { saveResult ->
-            saveResult.fold(
-                onSuccess = { snapshot ->
-                    if (!isActivityUnavailable()) {
-                        val automationOpenResult = openBaiduLinkWithAccessCodeIfEligible(snapshot)
-                        val openResult = automationOpenResult ?: AppIntentRouter.openTargetAppThenFallback(
-                            activity = this,
-                            url = snapshot.url,
-                            target = snapshot.target,
-                            sourceText = snapshot.text
-                        )
-                        recordReportAsync(
-                            entryPoint = EntryPoint.NOTIFICATION,
-                            success = openResult.success,
-                            failureReason = openResult.failureReason,
-                            target = snapshot.target,
-                            note = when {
-                                openResult.success && openResult.usedFallback ->
-                                    DiagnosticNotePolicy.NOTIFICATION_OPEN_FALLBACK_SUCCEEDED
-                                openResult.success ->
-                                    DiagnosticNotePolicy.NOTIFICATION_OPEN_SUCCEEDED
-                                else ->
-                                    DiagnosticNotePolicy.NOTIFICATION_OPEN_FAILED
-                            }
-                        ) {
-                            // Diagnostics are best effort and never change a completed save.
-                        }
-                        val toast = if (automationOpenResult?.success == true) {
-                            "已在浏览器打开，正在等待提取码输入框"
-                        } else {
-                            toastForOpenResult(openResult)
-                        }
-                        Toast.makeText(this, toast, Toast.LENGTH_SHORT).show()
-                        closeNotificationTask()
+        },
+            onResult = { activity, saveResult ->
+                saveResult.fold(
+                    onSuccess = activity::continueOpeningSavedSnapshot,
+                    onFailure = { error ->
+                        if (!activity.isActivityUnavailable()) activity.handleSaveFailure(error)
                     }
-                },
-                onFailure = { error ->
-                    if (!isActivityUnavailable()) handleSaveFailure(error)
-                }
-            )
-        }
+                )
+            }
+        )
     }
 
     /**
@@ -186,30 +165,74 @@ class NotificationEntryActivity : Activity() {
      * supported Baidu share code, reuse the existing one-shot fill task but pin the URL to the
      * selected browser so a verified app link cannot bypass the browser input page.
      */
-    private fun openBaiduLinkWithAccessCodeIfEligible(snapshot: ClipboardSnapshot): OpenResult? {
-        val url = snapshot.url ?: return null
-        val settingsStore = runCatching { AppSettingsStore(this) }.getOrNull() ?: return null
-        val automationEnabled = runCatching { settingsStore.isNetdiskAutomationEnabled() }
-            .getOrDefault(false)
-        val proAllowed = runCatching {
-            ProGate(this).check(ProFeature.AccessibilityAutomation).allowed
-        }.getOrDefault(false)
-        val accessibilityEnabled = runCatching {
-            NetdiskAccessibilityStatus.isServiceEnabled(this)
-        }.getOrDefault(false)
-        val browserPackage = runCatching {
-            BrowserFallback.resolveDefaultBrowserPackage(this)
-        }.getOrNull()
-        val plan = NetdiskNotificationAutomationPolicy.plan(
-            target = snapshot.target,
-            sourceText = snapshot.text,
-            url = url,
-            browserPackageName = browserPackage,
-            automationEnabled = automationEnabled,
-            proAllowed = proAllowed,
-            accessibilityEnabled = accessibilityEnabled
-        ) ?: return null
+    private fun continueOpeningSavedSnapshot(snapshot: ClipboardSnapshot) {
+        if (isActivityUnavailable()) return
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = {
+                val settingsStore = AppSettingsStore(app)
+                val plan = NetdiskNotificationAutomationPolicy.plan(
+                    target = snapshot.target,
+                    sourceText = snapshot.text,
+                    url = snapshot.url,
+                    browserPackageName = BrowserFallback.resolveDefaultBrowserPackage(app),
+                    automationEnabled = settingsStore.isNetdiskAutomationEnabled(),
+                    proAllowed = ProGate(app).check(ProFeature.AccessibilityAutomation).allowed,
+                    accessibilityEnabled = NetdiskAccessibilityStatus.isServiceEnabled(app)
+                )
+                plan
+            },
+            onResult = { activity, planResult ->
+                val plan = planResult.getOrNull()
+                activity.openSavedSnapshot(snapshot, plan)
+            }
+        )
+    }
 
+    private fun openSavedSnapshot(
+        snapshot: ClipboardSnapshot,
+        plan: com.privacyhub.automation.NetdiskNotificationAutomationPlan?
+    ) {
+        if (isActivityUnavailable()) return
+        val automationOpenResult = plan?.let { openBaiduLinkWithAccessCode(snapshot, it) }
+        val openResult = automationOpenResult ?: AppIntentRouter.openTargetAppThenFallback(
+            activity = this,
+            url = snapshot.url,
+            target = snapshot.target,
+            sourceText = snapshot.text
+        )
+        recordReportAsync(
+            entryPoint = EntryPoint.NOTIFICATION,
+            success = openResult.success,
+            failureReason = openResult.failureReason,
+            target = snapshot.target,
+            note = when {
+                openResult.success && openResult.usedFallback ->
+                    DiagnosticNotePolicy.NOTIFICATION_OPEN_FALLBACK_SUCCEEDED
+                openResult.success ->
+                    DiagnosticNotePolicy.NOTIFICATION_OPEN_SUCCEEDED
+                else ->
+                    DiagnosticNotePolicy.NOTIFICATION_OPEN_FAILED
+            }
+        ) { _, _ ->
+            // Diagnostics are best effort and never change a completed save.
+        }
+        val toast = if (automationOpenResult?.success == true) {
+            "已在浏览器打开，正在等待提取码输入框"
+        } else {
+            toastForOpenResult(openResult)
+        }
+        Toast.makeText(this, toast, Toast.LENGTH_SHORT).show()
+        closeNotificationTask()
+    }
+
+    private fun openBaiduLinkWithAccessCode(
+        snapshot: ClipboardSnapshot,
+        plan: com.privacyhub.automation.NetdiskNotificationAutomationPlan
+    ): OpenResult? {
+        val url = snapshot.url ?: return null
         val task = runCatching {
             NetdiskAccessCodeTaskController.start(
                 context = this,
@@ -233,14 +256,17 @@ class NotificationEntryActivity : Activity() {
         text: String,
         entryPoint: EntryPoint,
         successDiagnosticNote: String,
-        onResult: (Result<Long>) -> Unit
+        onResult: (NotificationEntryActivity, Result<Long>) -> Unit
     ) {
         val app = applicationContext
-        AppExecutors.executeDiskResult({
-            val store = LocalStore(app)
-            val target = LinkTargetDetector.detect(text)
-            val url = LinkParser.extractFirstUrl(text)
-            saveWithBestEffortDiagnostic(
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = {
+                val store = LocalStore(app)
+                val target = LinkTargetDetector.detect(text)
+                val url = LinkParser.extractFirstUrl(text)
+                saveWithBestEffortDiagnostic(
                 save = {
                     store.saveItemOnDisk(
                         entryPoint = entryPoint,
@@ -260,7 +286,9 @@ class NotificationEntryActivity : Activity() {
                     )
                 }
             )
-        }, onResult)
+            },
+            onResult = onResult
+        )
     }
 
     private fun recordReportAsync(
@@ -269,12 +297,15 @@ class NotificationEntryActivity : Activity() {
         failureReason: String?,
         target: LinkTarget?,
         note: String,
-        onComplete: (Result<Long>) -> Unit
+        onComplete: (NotificationEntryActivity, Result<Long>) -> Unit
     ) {
         val app = applicationContext
-        AppExecutors.executeDiskResult({
-            LocalStore(app).recordReportOnDisk(entryPoint, success, failureReason, target, note)
-        }, onComplete)
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { LocalStore(app).recordReportOnDisk(entryPoint, success, failureReason, target, note) },
+            onResult = onComplete
+        )
     }
 
     private fun handleSaveFailure(error: Throwable) {

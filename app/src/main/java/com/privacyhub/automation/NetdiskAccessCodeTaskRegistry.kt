@@ -64,6 +64,16 @@ class NetdiskAccessCodeTaskRegistry(
     }
 
     @Synchronized
+    fun hasActiveTaskForPackage(
+        packageName: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): Boolean {
+        val task = pending ?: return false
+        return nowMillis < task.expiresAtMillis &&
+            (task.expectedPackageName == packageName || task.fallbackBrowserPackageName == packageName)
+    }
+
+    @Synchronized
     fun complete(id: Long): PendingNetdiskAccessCodeTask? {
         val task = pending?.takeIf { it.id == id } ?: return null
         pending = null

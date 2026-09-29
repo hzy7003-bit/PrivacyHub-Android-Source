@@ -1,31 +1,33 @@
 package com.privacyhub.data.repository
 
 import android.content.Context
+import com.privacyhub.data.db.DatabaseAccessCoordinator
 import com.privacyhub.data.settings.AppSettingsStore
 import com.privacyhub.domain.model.EntryPoint
 import com.privacyhub.domain.model.LinkTarget
 import com.privacyhub.domain.model.SavedItem
 import com.privacyhub.domain.model.TestReport
 import com.privacyhub.domain.model.VaultItem
-import com.privacyhub.util.AppExecutors
+import androidx.annotation.WorkerThread
+import com.privacyhub.backup.VaultBackupRepository
+import com.privacyhub.data.settings.EncryptedSettingsWriteException
 
 class LocalStore(context: Context) {
     private val appContext = context.applicationContext
-    private val vaultRepository = VaultRepositoryImpl(appContext)
-    private val reportRepository = TestReportRepositoryImpl(appContext)
-    private val settingsStore = AppSettingsStore(appContext)
+    // Constructing the store from a UI event must not open SQLCipher as a side effect.
+    private val vaultRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { VaultRepositoryImpl(appContext) }
+    private val reportRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { TestReportRepositoryImpl(appContext) }
+    private val settingsStore by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { AppSettingsStore(appContext) }
+    private val backupRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { VaultBackupRepository(appContext) }
 
+    @WorkerThread
     fun saveItem(
         entryPoint: EntryPoint,
         sourceApp: String,
         originalText: String,
         primaryUrl: String?,
         target: LinkTarget
-    ): Long {
-        return AppExecutors.runDiskBlocking {
-            vaultRepository.saveText(entryPoint, sourceApp, originalText, primaryUrl, target)
-        }
-    }
+    ): Long = databaseAccess { vaultRepository.saveText(entryPoint, sourceApp, originalText, primaryUrl, target) }
 
     /**
      * Performs the repository write on the caller's disk worker.
@@ -37,30 +39,24 @@ class LocalStore(context: Context) {
         originalText: String,
         primaryUrl: String?,
         target: LinkTarget
-    ): Long = vaultRepository.saveText(entryPoint, sourceApp, originalText, primaryUrl, target)
+    ): Long = databaseAccess { vaultRepository.saveText(entryPoint, sourceApp, originalText, primaryUrl, target) }
 
+    @WorkerThread
     fun saveManualItem(
         title: String,
         content: String,
         category: String?,
         note: String?
-    ): Long {
-        return AppExecutors.runDiskBlocking {
-            vaultRepository.saveManual(title, content, category, note)
-        }
-    }
+    ): Long = databaseAccess { vaultRepository.saveManual(title, content, category, note) }
 
+    @WorkerThread
     fun recordReport(
         entryPoint: EntryPoint,
         success: Boolean,
         failureReason: String?,
         target: LinkTarget?,
         note: String
-    ): Long {
-        return AppExecutors.runDiskBlocking {
-            reportRepository.record(entryPoint, success, failureReason, target, note)
-        }
-    }
+    ): Long = databaseAccess { reportRepository.record(entryPoint, success, failureReason, target, note) }
 
     /** Performs the report write on the caller's disk worker. */
     internal fun recordReportOnDisk(
@@ -69,112 +65,199 @@ class LocalStore(context: Context) {
         failureReason: String?,
         target: LinkTarget?,
         note: String
-    ): Long = reportRepository.record(entryPoint, success, failureReason, target, note)
+    ): Long = databaseAccess { reportRepository.record(entryPoint, success, failureReason, target, note) }
 
-    fun recentItems(limit: Int = 20): List<SavedItem> {
-        return AppExecutors.runDiskBlocking { vaultRepository.recentSavedItems(limit) }
+    @WorkerThread
+    fun recentItems(limit: Int = 20): List<SavedItem> = databaseAccess { vaultRepository.recentSavedItems(limit) }
+
+    @WorkerThread
+    fun favoriteItems(limit: Int = 20): List<SavedItem> = databaseAccess { vaultRepository.favoriteSavedItems(limit) }
+
+    @WorkerThread
+    fun categoryItems(category: String, limit: Int = 20): List<SavedItem> = databaseAccess { vaultRepository.categorySavedItems(category, limit) }
+
+    @WorkerThread
+    fun categories(): List<String> = DatabaseAccessCoordinator.withDatabaseWriteAccess {
+        settingsStore.allKnownCategories(vaultRepository.categories())
     }
 
-    fun favoriteItems(limit: Int = 20): List<SavedItem> {
-        return AppExecutors.runDiskBlocking { vaultRepository.favoriteSavedItems(limit) }
+    @WorkerThread
+    fun homeTags(): List<String> = DatabaseAccessCoordinator.withDatabaseWriteAccess {
+        settingsStore.homeTags(vaultRepository.categories())
     }
 
-    fun categoryItems(category: String, limit: Int = 20): List<SavedItem> {
-        return AppExecutors.runDiskBlocking { vaultRepository.categorySavedItems(category, limit) }
-    }
-
-    fun categories(): List<String> {
-        return AppExecutors.runDiskBlocking { settingsStore.allKnownCategories(vaultRepository.categories()) }
-    }
-
-    fun homeTags(): List<String> {
-        return AppExecutors.runDiskBlocking { settingsStore.homeTags(vaultRepository.categories()) }
-    }
-
+    @WorkerThread
     fun categorySettingsReadError(): String? =
-        AppExecutors.runDiskBlocking { settingsStore.categorySettingsReadError() }
+        databaseAccess { settingsStore.categorySettingsReadError() }
 
-    fun addCategory(name: String): Boolean {
-        return settingsStore.addCategory(name)
+    @WorkerThread
+    fun addCategory(name: String): Boolean = DatabaseAccessCoordinator.withDatabaseWriteAccess {
+        prepareCategorySettings()
+        settingsStore.addCategory(name)
     }
 
+    @WorkerThread
     fun renameCategory(oldName: String, newName: String): Int {
         val old = oldName.trim()
         val new = newName.trim()
         if (old.isBlank() || new.isBlank() || old == new) return 0
-        return AppExecutors.runDiskBlocking {
-            requireCategorySettingsReadable()
-            val normalizedNew = settingsStore.normalizeCategoryForStorage(new) ?: return@runDiskBlocking 0
-            if (settingsStore.isSystemCategory(old)) {
-                if (!settingsStore.isSystemCategory(normalizedNew)) {
-                    settingsStore.addCategory(normalizedNew)
+        val normalizedNew = settingsStore.normalizeCategoryForStorage(new) ?: return 0
+        return backupRepository.runCoordinatedCategoryMutation(
+            prepareSettings = ::prepareCategorySettings,
+            applyRoom = { vaultRepository.renameCategory(old, new) },
+            applySettings = {
+                if (settingsStore.isSystemCategory(old)) {
+                    ensureCategoryExists(normalizedNew)
+                    requireCategorySettingsWrite(
+                        settingsStore.setCategoryAlias(old, normalizedNew, vaultRepository.categories())
+                    )
+                } else {
+                    requireCategorySettingsWrite(settingsStore.renameCustomCategory(old, normalizedNew))
                 }
-                settingsStore.setCategoryAlias(old, normalizedNew)
-            } else {
-                settingsStore.renameCustomCategory(old, normalizedNew)
+                true
             }
-            vaultRepository.renameCategory(old, new)
-        }
+        )
     }
 
+    @WorkerThread
     fun removeCategory(name: String): Int {
         val category = name.trim()
         if (category.isBlank()) return 0
-        return AppExecutors.runDiskBlocking {
-            requireCategorySettingsReadable()
-            settingsStore.removeCustomCategory(category)
-            vaultRepository.clearCategory(category)
-        }
+        return backupRepository.runCoordinatedCategoryMutation(
+            prepareSettings = ::prepareCategorySettings,
+            applyRoom = { vaultRepository.clearCategory(category) },
+            applySettings = {
+                requireCategorySettingsWrite(settingsStore.removeCustomCategory(category))
+                true
+            }
+        )
     }
 
+    @WorkerThread
     fun isSystemCategory(name: String): Boolean {
-        return settingsStore.isSystemCategory(name)
+        return databaseAccess { settingsStore.isSystemCategory(name) }
     }
 
+    @WorkerThread
     fun countByCategory(name: String): Int {
-        return AppExecutors.runDiskBlocking { vaultRepository.countByCategory(name) }
+        return databaseAccess { vaultRepository.countByCategory(name) }
     }
 
+    @WorkerThread
     fun moveCategory(oldName: String, newName: String): Int {
         val target = settingsStore.normalizeCategoryForStorage(newName) ?: return 0
-        return AppExecutors.runDiskBlocking {
-            requireCategorySettingsReadable()
-            if (!settingsStore.isSystemCategory(target)) {
-                settingsStore.addCategory(target)
+        return backupRepository.runCoordinatedCategoryMutation(
+            prepareSettings = ::prepareCategorySettings,
+            applyRoom = { vaultRepository.moveCategory(oldName, target) },
+            applySettings = {
+                ensureCategoryExists(target)
+                true
             }
-            vaultRepository.moveCategory(oldName, target)
+        )
+    }
+
+    /** Moves the rows and removes a custom source label as one recoverable operation. */
+    @WorkerThread
+    fun moveCategoryAndRemoveCustomSource(oldName: String, newName: String): Int {
+        val old = oldName.trim()
+        val target = settingsStore.normalizeCategoryForStorage(newName) ?: return 0
+        if (old.isBlank() || old == target) return 0
+        return backupRepository.runCoordinatedCategoryMutation(
+            prepareSettings = ::prepareCategorySettings,
+            applyRoom = { vaultRepository.moveCategory(old, target) },
+            applySettings = {
+                ensureCategoryExists(target)
+                if (!settingsStore.isSystemCategory(old)) {
+                    requireCategorySettingsWrite(settingsStore.removeCustomCategory(old))
+                }
+                true
+            }
+        )
+    }
+
+    @WorkerThread
+    fun deleteCategoryItems(name: String): Int {
+        return databaseAccess { vaultRepository.deleteByCategory(name) }
+    }
+
+    /** Deletes explicitly confirmed content and custom metadata in the same recoverable unit. */
+    @WorkerThread
+    fun deleteCategoryItemsAndMaybeRemoveCustomCategory(name: String, removeCustomCategory: Boolean): Int {
+        val category = name.trim()
+        if (category.isBlank()) return 0
+        if (!removeCustomCategory) {
+            return DatabaseAccessCoordinator.withDatabaseWriteAccess {
+                vaultRepository.deleteByCategory(category)
+            }
+        }
+        return backupRepository.runCoordinatedCategoryMutation(
+            prepareSettings = ::prepareCategorySettings,
+            applyRoom = { vaultRepository.deleteByCategory(category) },
+            applySettings = {
+                requireCategorySettingsWrite(settingsStore.removeCustomCategory(category))
+                true
+            }
+        )
+    }
+
+    @WorkerThread
+    fun deleteCustomCategory(name: String): Boolean {
+        return DatabaseAccessCoordinator.withDatabaseWriteAccess {
+            prepareCategorySettings()
+            val category = settingsStore.normalizeCategoryForStorage(name) ?: return@withDatabaseWriteAccess false
+            if (settingsStore.isSystemCategory(category)) return@withDatabaseWriteAccess false
+            requireCategorySettingsWrite(settingsStore.removeCustomCategory(category))
+            true
         }
     }
 
-    fun deleteCategoryItems(name: String): Int {
-        return AppExecutors.runDiskBlocking { vaultRepository.deleteByCategory(name) }
-    }
-
-    fun deleteCustomCategory(name: String): Boolean {
-        requireCategorySettingsReadable()
-        val category = settingsStore.normalizeCategoryForStorage(name) ?: return false
-        if (settingsStore.isSystemCategory(category)) return false
-        settingsStore.removeCustomCategory(category)
-        return true
-    }
-
+    @WorkerThread
     fun addHomeTag(name: String): Boolean {
-        return AppExecutors.runDiskBlocking { settingsStore.addHomeTag(name, vaultRepository.categories()) }
+        return DatabaseAccessCoordinator.withDatabaseWriteAccess {
+            prepareCategorySettings()
+            settingsStore.addHomeTag(name, vaultRepository.categories())
+        }
     }
 
+    @WorkerThread
     fun removeHomeTag(name: String) {
-        settingsStore.removeHomeTag(name)
+        DatabaseAccessCoordinator.withDatabaseWriteAccess {
+            prepareCategorySettings()
+            requireCategorySettingsWrite(settingsStore.removeHomeTag(name))
+        }
     }
 
+    @WorkerThread
     fun moveHomeTag(name: String, direction: Int): Boolean {
-        return AppExecutors.runDiskBlocking {
+        return DatabaseAccessCoordinator.withDatabaseWriteAccess {
+            prepareCategorySettings()
             settingsStore.moveHomeTag(name, direction, vaultRepository.categories())
         }
     }
 
+    @WorkerThread
     fun setCategoryAlias(systemCategory: String, userCategory: String) {
+        DatabaseAccessCoordinator.withDatabaseWriteAccess {
+            prepareCategorySettings()
+            requireCategorySettingsWrite(
+                settingsStore.setCategoryAlias(systemCategory, userCategory, vaultRepository.categories())
+            )
+        }
+    }
+
+    private fun ensureCategoryExists(category: String) {
+        if (settingsStore.isSystemCategory(category)) return
+        if (category in settingsStore.customCategories() || category in vaultRepository.categories()) return
+        requireCategorySettingsWrite(settingsStore.addCategory(category))
+    }
+
+    private fun prepareCategorySettings() {
         requireCategorySettingsReadable()
-        settingsStore.setCategoryAlias(systemCategory, userCategory)
+        settingsStore.allKnownCategories(vaultRepository.categories())
+    }
+
+    private fun requireCategorySettingsWrite(success: Boolean) {
+        if (!success) throw EncryptedSettingsWriteException("分类设置未能保存，操作未完成。")
     }
 
     private fun requireCategorySettingsReadable() {
@@ -183,14 +266,17 @@ class LocalStore(context: Context) {
         }
     }
 
+    @WorkerThread
     fun searchItems(query: String, limit: Int = 20): List<SavedItem> {
-        return AppExecutors.runDiskBlocking { vaultRepository.searchSavedItems(query, limit) }
+        return databaseAccess { vaultRepository.searchSavedItems(query, limit) }
     }
 
+    @WorkerThread
     fun getItem(id: Long): VaultItem? {
-        return AppExecutors.runDiskBlocking { vaultRepository.getById(id) }
+        return databaseAccess { vaultRepository.getById(id) }
     }
 
+    @WorkerThread
     fun updateItem(
         id: Long,
         title: String,
@@ -199,22 +285,25 @@ class LocalStore(context: Context) {
         category: String?,
         note: String?
     ) {
-        AppExecutors.runDiskBlocking {
-            vaultRepository.updateDetails(id, title, content, accessCode, category, note)
-        }
+        databaseAccess { vaultRepository.updateDetails(id, title, content, accessCode, category, note) }
     }
 
+    @WorkerThread
     fun setFavorite(id: Long, favorite: Boolean) {
-        AppExecutors.runDiskBlocking { vaultRepository.setFavorite(id, favorite) }
+        databaseAccess { vaultRepository.setFavorite(id, favorite) }
     }
 
+    @WorkerThread
     fun deleteItem(id: Long) {
-        AppExecutors.runDiskBlocking { vaultRepository.delete(id) }
+        databaseAccess { vaultRepository.delete(id) }
     }
 
+    @WorkerThread
     fun recentReports(limit: Int = 50): List<TestReport> {
-        return AppExecutors.runDiskBlocking { reportRepository.recent(limit) }
+        return databaseAccess { reportRepository.recent(limit) }
     }
+
+    private fun <T> databaseAccess(task: () -> T): T = DatabaseAccessCoordinator.withDatabaseAccess(task)
 }
 
 /** A diagnostics failure must never change the result of a completed core save. */

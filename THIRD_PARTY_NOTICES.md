@@ -1,6 +1,6 @@
 # Third-party notices
 
-This notice covers third-party components shipped in the PrivacyHub 0.10.4-beta application and the third-party binary included in this source snapshot. It is a scoped attribution summary, not an exhaustive software bill of materials or a legal opinion. Each component remains under its own license; the PrivacyHub license does not replace those terms.
+This notice covers third-party components shipped in the PrivacyHub 0.10.5-beta application and the third-party binary included in this source snapshot. It is a scoped attribution summary, not an exhaustive software bill of materials or a legal opinion. Each component remains under its own license; the PrivacyHub license does not replace those terms.
 
 ## Application runtime
 

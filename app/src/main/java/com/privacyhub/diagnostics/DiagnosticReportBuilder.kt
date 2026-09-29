@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import com.privacyhub.data.db.PrivacyHubDatabaseProvider
+import com.privacyhub.data.db.DatabaseAccessCoordinator
 import com.privacyhub.data.repository.LocalStore
 import com.privacyhub.data.settings.AppSettingsStore
 import com.privacyhub.device.DeviceInfoProvider
@@ -17,10 +18,10 @@ class DiagnosticReportBuilder(private val context: Context) {
     private val store = LocalStore(appContext)
     private val settingsStore = AppSettingsStore(appContext)
 
-    fun build(): DiagnosticReport {
+    fun build(): DiagnosticReport = DatabaseAccessCoordinator.withDatabaseAccess {
         val recentReports = store.recentReports(limit = 20)
         val failures = recentReports.filterNot { it.success }.take(20)
-        return DiagnosticReport(
+        DiagnosticReport(
             generatedAt = Formatters.time(System.currentTimeMillis()),
             appVersion = appVersion(),
             deviceInfo = deviceInfo(),

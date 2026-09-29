@@ -8,9 +8,16 @@ internal enum class RestoreJournalState {
     DatabaseCommitted
 }
 
+/** Values persisted in the existing restore journal; this does not change the backup payload. */
+internal enum class RestoreJournalOperation {
+    Merge,
+    Replace,
+    CategoryMutation
+}
+
 internal data class RestoreJournal(
     val operationId: String,
-    val mode: RestoreMode,
+    val operation: RestoreJournalOperation,
     val state: RestoreJournalState,
     val startedAtMillis: Long
 )
@@ -26,8 +33,14 @@ internal interface RestoreDatabaseGateway {
     fun restoreInTransaction(
         payload: BackupPayload,
         mode: RestoreMode,
+        operationId: String,
         applySettings: () -> Unit
     ): RestoreCounts
+    fun <T> runCoordinatedMutationInTransaction(
+        operationId: String,
+        applyRoom: () -> T,
+        applySettings: () -> Unit
+    ): T
     fun clearJournal(operationId: String)
 }
 
@@ -65,35 +78,122 @@ internal class RestoreProtocol(
             database.prepareJournal(
                 RestoreJournal(
                     operationId = operationId,
-                    mode = mode,
+                    operation = mode.toJournalOperation(),
                     state = RestoreJournalState.Prepared,
                     startedAtMillis = clock()
                 )
             )
-            val counts = database.restoreInTransaction(payload, mode) {
+        } catch (error: Exception) {
+            throw recoverAfterFailure(error, "恢复失败，自动回滚尚未完成；请重新打开备份页后重试。")
+        }
+
+        val counts = try {
+            database.restoreInTransaction(payload, mode, operationId) {
                 requireSettingsWrite(
                     settings.apply(payload.settings, mode),
                     "恢复设置未能持久化。"
                 )
             }
+        } catch (error: Exception) {
+            throw recoverAfterFailure(error, "恢复失败，自动回滚尚未完成；请重新打开备份页后重试。")
+        }
+
+        val result = RestoreResult(
+            insertedItems = counts.insertedItems,
+            skippedItems = payload.items.size - counts.insertedItems,
+            insertedCredentials = counts.insertedCredentials,
+            skippedCredentials = payload.autofillCredentials.size - counts.insertedCredentials
+        )
+        try {
             finalizeCommittedRestore(operationId)
-            return RestoreResult(
-                insertedItems = counts.insertedItems,
-                skippedItems = payload.items.size - counts.insertedItems,
-                insertedCredentials = counts.insertedCredentials,
-                skippedCredentials = payload.autofillCredentials.size - counts.insertedCredentials
-            )
         } catch (error: Exception) {
             val recoveryError = runCatching { recoverInterruptedRestoreLocked() }.exceptionOrNull()
             if (recoveryError != null) {
                 error.addSuppressed(recoveryError)
                 throw RestoreConsistencyException(
                     "恢复失败，自动回滚尚未完成；请重新打开备份页后重试。",
-                    error
+                    error,
+                    recoveryIncomplete = true
                 )
             }
-            throw error
+            // Recovery observed the committed phase and completed finalization; restore succeeded.
         }
+        return result
+    }
+
+    /**
+     * Coordinates category metadata in encrypted settings with Room rows using the same staged
+     * rollback and durable journal as restore. Room rolls back the data mutation and journal phase
+     * together; the journal then decides whether startup recovery restores or keeps settings.
+     */
+    fun <T> runCoordinatedMutation(
+        applyRoom: () -> T,
+        applySettings: () -> Boolean
+    ): T = synchronized(PROCESS_LOCK) {
+        val existingJournal = try {
+            database.currentJournal()
+        } catch (error: Exception) {
+            throw RestoreConsistencyException(
+                "无法确认上次数据一致性操作状态；数据库访问已暂停，请重新打开应用重试。",
+                error,
+                recoveryIncomplete = true
+            )
+        }
+        if (existingJournal != null) {
+            try {
+                recoverInterruptedRestoreLocked()
+            } catch (error: Exception) {
+                throw RestoreConsistencyException(
+                    "上次数据一致性恢复尚未完成；数据库访问已暂停，请重新打开应用重试。",
+                    error,
+                    recoveryIncomplete = true
+                )
+            }
+        }
+        val operationId = operationIdFactory()
+        try {
+            requireSettingsWrite(settings.stageRollback(operationId), "无法保护操作前的分类设置。")
+            database.prepareJournal(
+                RestoreJournal(
+                    operationId = operationId,
+                    operation = RestoreJournalOperation.CategoryMutation,
+                    state = RestoreJournalState.Prepared,
+                    startedAtMillis = clock()
+                )
+            )
+        } catch (error: Exception) {
+            throw recoverAfterFailure(
+                error,
+                completeMessage = "分类操作未完成，已恢复原状态；请重试。"
+            )
+        }
+
+        val result = try {
+            database.runCoordinatedMutationInTransaction(operationId, applyRoom) {
+                requireSettingsWrite(applySettings(), "分类设置未能保存，操作已回滚。")
+            }
+        } catch (error: Exception) {
+            throw recoverAfterFailure(
+                error,
+                completeMessage = "分类操作未完成，已恢复原状态；请重试。"
+            )
+        }
+
+        try {
+            finalizeCommittedRestore(operationId)
+        } catch (error: Exception) {
+            val recoveryError = runCatching { recoverInterruptedRestoreLocked() }.exceptionOrNull()
+            if (recoveryError != null) {
+                error.addSuppressed(recoveryError)
+                throw RestoreConsistencyException(
+                    "分类操作已提交，但安全恢复尚未完成；数据库访问已暂停，请重新打开应用重试。",
+                    error,
+                    recoveryIncomplete = true
+                )
+            }
+            // A committed operation was successfully finalized by recovery. Report it as success.
+        }
+        result
     }
 
     fun recoverInterruptedRestore() = synchronized(PROCESS_LOCK) {
@@ -133,8 +233,30 @@ internal class RestoreProtocol(
         database.clearJournal(operationId)
     }
 
+    private fun recoverAfterFailure(
+        error: Exception,
+        incompleteMessage: String = "分类操作失败，自动恢复尚未完成；数据库访问已暂停，请重新打开应用重试。",
+        completeMessage: String? = null
+    ): Exception {
+        val recoveryError = runCatching { recoverInterruptedRestoreLocked() }.exceptionOrNull()
+        if (recoveryError == null) {
+            return completeMessage?.let { RestoreConsistencyException(it, error) } ?: error
+        }
+        error.addSuppressed(recoveryError)
+        return RestoreConsistencyException(
+            incompleteMessage,
+            error,
+            recoveryIncomplete = true
+        )
+    }
+
     private fun requireSettingsWrite(success: Boolean, message: String) {
         if (!success) throw RestoreConsistencyException(message)
+    }
+
+    private fun RestoreMode.toJournalOperation(): RestoreJournalOperation = when (this) {
+        RestoreMode.Merge -> RestoreJournalOperation.Merge
+        RestoreMode.Replace -> RestoreJournalOperation.Replace
     }
 
     private companion object {
@@ -255,5 +377,9 @@ internal object BackupPayloadValidator {
     private fun invalid(message: String): Nothing = throw BackupFormatException(message)
 }
 
-class RestoreConsistencyException(message: String, cause: Throwable? = null) :
+class RestoreConsistencyException(
+    message: String,
+    cause: Throwable? = null,
+    val recoveryIncomplete: Boolean = false
+) :
     IllegalStateException(message, cause)

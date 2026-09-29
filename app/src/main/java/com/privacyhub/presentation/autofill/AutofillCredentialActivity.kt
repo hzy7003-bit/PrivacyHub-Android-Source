@@ -2,6 +2,7 @@ package com.privacyhub.presentation.autofill
 
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
@@ -28,15 +29,17 @@ import com.privacyhub.presentation.ui.ButtonKind
 import com.privacyhub.presentation.ui.FrostedUi
 import com.privacyhub.pro.ProFeature
 import com.privacyhub.pro.ProGate
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import com.privacyhub.util.ActivityTaskScope
 
 class AutofillCredentialActivity : SecureActivity() {
-    private val repository by lazy { AutofillCredentialRepository(this) }
     private val settingsStore by lazy { AppSettingsStore(this) }
-    private val proGate by lazy { ProGate(this) }
-    private val databaseExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val loadTasks by lazy { ActivityTaskScope(this) }
+    private val operationTasks by lazy { ActivityTaskScope(this) }
+    private val pickerTasks by lazy { ActivityTaskScope(this) }
     private var credentials: List<AutofillCredentialEntity> = emptyList()
+    private var proCheckInFlight = false
+    private var operationInFlight = false
+    private var pendingAppSelection: ((LaunchableApp) -> Unit)? = null
 
     override fun onSecureCreate(savedInstanceState: Bundle?) {
         super.onSecureCreate(savedInstanceState)
@@ -46,19 +49,32 @@ class AutofillCredentialActivity : SecureActivity() {
     override fun onUnlocked() = loadCredentials()
 
     override fun onDestroy() {
-        databaseExecutor.shutdownNow()
+        loadTasks.close()
+        operationTasks.close()
+        pickerTasks.close()
+        pendingAppSelection = null
         super.onDestroy()
     }
 
     private fun loadCredentials() {
-        databaseExecutor.execute {
-            val loaded = repository.all()
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                credentials = loaded
-                render()
+        val app = applicationContext
+        val generation = loadTasks.nextGeneration()
+        loadTasks.executeDisk(
+            generation,
+            task = { AutofillCredentialRepository(app).all() },
+            onResult = { owner, result ->
+                val activity = owner as AutofillCredentialActivity
+                result.fold(
+                    onSuccess = { loaded ->
+                        activity.credentials = loaded
+                        activity.render()
+                    },
+                    onFailure = { error ->
+                        Toast.makeText(activity, error.message ?: "无法读取登录信息", Toast.LENGTH_LONG).show()
+                    }
+                )
             }
-        }
+        )
     }
 
     private fun render() {
@@ -103,26 +119,79 @@ class AutofillCredentialActivity : SecureActivity() {
     }
 
     private fun toggleAutofill() {
+        if (operationInFlight || proCheckInFlight) return
         val enabled = settingsStore.isAutofillEnabled()
         if (!enabled) {
-            val gate = proGate.check(ProFeature.Autofill)
-            if (!gate.allowed) {
-                Toast.makeText(this, gate.message, Toast.LENGTH_LONG).show()
-                return
-            }
+            checkProGate(ProAuthorizedAction.EnableAutofill)
+            return
         }
-        settingsStore.setAutofillEnabled(!enabled)
-        render()
+        updateAutofillEnabled(false)
     }
 
     private fun showCredentialDialog(existing: AutofillCredentialEntity? = null) {
         if (existing == null) {
-            val gate = proGate.check(ProFeature.Autofill)
-            if (!gate.allowed) {
-                Toast.makeText(this, gate.message, Toast.LENGTH_LONG).show()
-                return
-            }
+            if (operationInFlight || proCheckInFlight) return
+            checkProGate(ProAuthorizedAction.AddCredential)
+            return
         }
+        showCredentialDialogAfterGate(existing)
+    }
+
+    private fun checkProGate(action: ProAuthorizedAction) {
+        if (proCheckInFlight) return
+        proCheckInFlight = true
+        val app = applicationContext
+        val generation = operationTasks.nextGeneration()
+        operationTasks.executeDisk(
+            generation,
+            task = { ProGate(app).check(ProFeature.Autofill) },
+            onResult = { owner, result ->
+                val activity = owner as AutofillCredentialActivity
+                activity.proCheckInFlight = false
+                result.fold(
+                    onSuccess = { gate ->
+                        if (!gate.allowed) {
+                            Toast.makeText(activity, gate.message, Toast.LENGTH_LONG).show()
+                        } else {
+                            when (action) {
+                                ProAuthorizedAction.EnableAutofill -> activity.updateAutofillEnabled(true)
+                                ProAuthorizedAction.AddCredential -> activity.showCredentialDialogAfterGate(null)
+                            }
+                        }
+                    },
+                    onFailure = { error ->
+                        Toast.makeText(activity, error.message ?: "暂时无法验证 Pro 授权", Toast.LENGTH_LONG).show()
+                    }
+                )
+            }
+        )
+    }
+
+    private fun updateAutofillEnabled(enabled: Boolean) {
+        if (operationInFlight) return
+        operationInFlight = true
+        val app = applicationContext
+        val generation = operationTasks.nextGeneration()
+        operationTasks.executeDisk(
+            generation,
+            task = {
+                AppSettingsStore(app).setAutofillEnabled(enabled)
+                enabled
+            },
+            onResult = { owner, result ->
+                val activity = owner as AutofillCredentialActivity
+                activity.operationInFlight = false
+                result.fold(
+                    onSuccess = { activity.render() },
+                    onFailure = { error ->
+                        Toast.makeText(activity, error.message ?: "无法更改自动填充设置", Toast.LENGTH_LONG).show()
+                    }
+                )
+            }
+        )
+    }
+
+    private fun showCredentialDialogAfterGate(existing: AutofillCredentialEntity?) {
         val label = input("名称，例如：淘宝主账号", false).apply { setText(existing?.label.orEmpty()) }
         val username = input("账号", false).apply { setText(existing?.username.orEmpty()) }
         val password = input("密码", true).apply { setText(existing?.password.orEmpty()) }
@@ -213,78 +282,104 @@ class AutofillCredentialActivity : SecureActivity() {
                 val valuePassword = password.text.toString()
                 password.text?.clear()
                 dialog.dismiss()
-                databaseExecutor.execute {
-                    val result = runCatching {
+                if (operationInFlight) return@setOnClickListener
+                operationInFlight = true
+                val app = applicationContext
+                val generation = operationTasks.nextGeneration()
+                operationTasks.executeDisk(
+                    generation,
+                    task = {
+                        val repository = AutofillCredentialRepository(app)
                         if (existing == null) {
                             repository.save(valueLabel, valueUsername, valuePassword, packageName, valueWebDomain)
                         } else {
                             repository.update(existing, valueLabel, valueUsername, valuePassword, packageName, valueWebDomain)
                         }
+                    },
+                    onResult = { owner, result ->
+                        val activity = owner as AutofillCredentialActivity
+                        activity.operationInFlight = false
+                        result.fold(
+                            onSuccess = { activity.loadCredentials() },
+                            onFailure = {
+                                Toast.makeText(
+                                    activity,
+                                    if (websiteScope) "网站域名无效或不支持该范围" else "应用未安装或无法读取签名身份，请重新选择应用",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        )
                     }
-                    runOnUiThread {
-                        if (result.isSuccess) {
-                            loadCredentials()
-                        } else {
-                            Toast.makeText(
-                                this,
-                                if (websiteScope) "网站域名无效或不支持该范围" else "应用未安装或无法读取签名身份，请重新选择应用",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        }
-                    }
-                }
+                )
             }
         }
         dialog.show()
     }
 
     private fun showAppPicker(onSelected: (LaunchableApp) -> Unit) {
-        databaseExecutor.execute {
-            val apps = loadLaunchableApps()
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                val search = input("搜索本机应用", false)
-                val list = ListView(this)
-                val shownApps = apps.toMutableList()
-                val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, shownApps.map(LaunchableApp::displayText).toMutableList())
-                list.adapter = adapter
-                fun update(query: String) {
-                    shownApps.clear()
-                    shownApps += apps.filter { app ->
-                        app.label.contains(query, ignoreCase = true) || app.packageName.contains(query, ignoreCase = true)
+        pendingAppSelection = onSelected
+        val app = applicationContext
+        val generation = pickerTasks.nextGeneration()
+        pickerTasks.executeDisk(
+            generation,
+            task = { loadLaunchableApps(app) },
+            onResult = { owner, result ->
+                val activity = owner as AutofillCredentialActivity
+                result.fold(
+                    onSuccess = activity::showAppPickerDialog,
+                    onFailure = { error ->
+                        activity.pendingAppSelection = null
+                        Toast.makeText(activity, error.message ?: "无法读取本机应用", Toast.LENGTH_LONG).show()
                     }
-                    adapter.clear()
-                    adapter.addAll(shownApps.map(LaunchableApp::displayText))
-                    adapter.notifyDataSetChanged()
-                }
-                search.addTextChangedListener(object : TextWatcher {
-                    override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
-                    override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = update((s ?: "").toString())
-                    override fun afterTextChanged(s: Editable?) = Unit
-                })
-                val content = LinearLayout(this).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(6), 0, dp(6), 0)
-                    addView(search, LinearLayout.LayoutParams(-1, dp(52)))
-                    addView(list, LinearLayout.LayoutParams(-1, dp(340)))
-                }
-                val dialog = AlertDialog.Builder(this)
-                    .setTitle("选择适用应用")
-                    .setMessage("只显示系统桌面可发现的本机应用，不申请全量应用列表权限。")
-                    .setView(content)
-                    .setNegativeButton("取消", null)
-                    .create()
-                list.setOnItemClickListener { _, _, position, _ ->
-                    onSelected(shownApps[position])
-                    dialog.dismiss()
-                }
-                dialog.show()
+                )
             }
-        }
+        )
     }
 
-    private fun loadLaunchableApps(): List<LaunchableApp> {
+    private fun showAppPickerDialog(apps: List<LaunchableApp>) {
+        val search = input("搜索本机应用", false)
+        val list = ListView(this)
+        val shownApps = apps.toMutableList()
+        val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, shownApps.map(LaunchableApp::displayText).toMutableList())
+        list.adapter = adapter
+        fun update(query: String) {
+            shownApps.clear()
+            shownApps += apps.filter { app ->
+                app.label.contains(query, ignoreCase = true) || app.packageName.contains(query, ignoreCase = true)
+            }
+            adapter.clear()
+            adapter.addAll(shownApps.map(LaunchableApp::displayText))
+            adapter.notifyDataSetChanged()
+        }
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = update((s ?: "").toString())
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(6), 0, dp(6), 0)
+            addView(search, LinearLayout.LayoutParams(-1, dp(52)))
+            addView(list, LinearLayout.LayoutParams(-1, dp(340)))
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("选择适用应用")
+            .setMessage("只显示系统桌面可发现的本机应用，不申请全量应用列表权限。")
+            .setView(content)
+            .setNegativeButton("取消", null)
+            .create()
+        list.setOnItemClickListener { _, _, position, _ ->
+            pendingAppSelection?.invoke(shownApps[position])
+            pendingAppSelection = null
+            dialog.dismiss()
+        }
+        dialog.setOnDismissListener { pendingAppSelection = null }
+        dialog.show()
+    }
+
+    private fun loadLaunchableApps(context: Context): List<LaunchableApp> {
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val packageManager = context.packageManager
         return packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
             .map { info ->
                 LaunchableApp(
@@ -331,10 +426,24 @@ class AutofillCredentialActivity : SecureActivity() {
     private fun confirmDelete(credential: AutofillCredentialEntity) {
         AlertDialog.Builder(this).setTitle("删除登录信息").setMessage("将删除“${credential.label}”。")
             .setNegativeButton("取消", null).setPositiveButton("删除") { _, _ ->
-                databaseExecutor.execute {
-                    repository.delete(credential.id)
-                    loadCredentials()
-                }
+                if (operationInFlight) return@setPositiveButton
+                operationInFlight = true
+                val app = applicationContext
+                val generation = operationTasks.nextGeneration()
+                operationTasks.executeDisk(
+                    generation,
+                    task = { AutofillCredentialRepository(app).delete(credential.id) },
+                    onResult = { owner, result ->
+                        val activity = owner as AutofillCredentialActivity
+                        activity.operationInFlight = false
+                        result.fold(
+                            onSuccess = { activity.loadCredentials() },
+                            onFailure = { error ->
+                                Toast.makeText(activity, error.message ?: "无法删除登录信息", Toast.LENGTH_LONG).show()
+                            }
+                        )
+                    }
+                )
             }.show()
     }
 
@@ -373,5 +482,10 @@ class AutofillCredentialActivity : SecureActivity() {
 
     private data class LaunchableApp(val label: String, val packageName: String) {
         val displayText: String get() = "$label\n$packageName"
+    }
+
+    private enum class ProAuthorizedAction {
+        EnableAutofill,
+        AddCredential
     }
 }

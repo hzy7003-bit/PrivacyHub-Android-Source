@@ -31,19 +31,22 @@ import com.privacyhub.presentation.ui.FrostedUi
 import com.privacyhub.presentation.pro.ProLicenseActivity
 import com.privacyhub.pro.ProFeature
 import com.privacyhub.pro.ProGate
+import com.privacyhub.util.ActivityTaskScope
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 class BackupActivity : SecureActivity() {
-    private val backupRepository by lazy { VaultBackupRepository(this) }
-    private val proGate by lazy { ProGate(this) }
+    private val tasks by lazy { ActivityTaskScope(this) }
     private val backupImportSession = BackupImportSession()
     private var importPasswordDialog: AlertDialog? = null
     private var importPasswordInput: EditText? = null
     private var pendingExportPassword: CharArray? = null
     private var pendingRestorePayload: BackupPayload? = null
+    private var backupOperationInFlight = false
+    private var filePickerInFlight = false
 
     private val createBackupFile = registerForActivityResult(
         ActivityResultContracts.CreateDocument(BACKUP_MIME_TYPE)
@@ -52,6 +55,7 @@ class BackupActivity : SecureActivity() {
         pendingExportPassword = null
         if (uri == null || password == null) {
             password?.fill('\u0000')
+            backupOperationInFlight = false
             return@registerForActivityResult
         }
         exportBackup(uri.toString(), password)
@@ -60,6 +64,7 @@ class BackupActivity : SecureActivity() {
     private val openBackupFile = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
+        filePickerInFlight = false
         if (uri != null) {
             backupImportSession.select(uri.toString())
             showImportPasswordDialog()
@@ -78,6 +83,7 @@ class BackupActivity : SecureActivity() {
     }
 
     override fun onDestroy() {
+        tasks.close()
         backupImportSession.cancel()
         importPasswordInput?.text?.clear()
         importPasswordInput = null
@@ -132,6 +138,8 @@ class BackupActivity : SecureActivity() {
                 "选择备份文件",
                 ButtonKind.Secondary
             ) {
+                if (backupOperationInFlight || filePickerInFlight || pendingExportPassword != null) return@panel
+                filePickerInFlight = true
                 openBackupFile.launch(arrayOf(BACKUP_MIME_TYPE, "application/octet-stream"))
             }
         )
@@ -148,7 +156,23 @@ class BackupActivity : SecureActivity() {
     }
 
     private fun requestExport() {
-        val gate = proGate.check(ProFeature.BatchExport)
+        if (backupOperationInFlight || filePickerInFlight || pendingExportPassword != null) return
+        backupOperationInFlight = true
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { ProGate(app).check(ProFeature.BatchExport) },
+            onResult = { owner, result -> (owner as BackupActivity).finishExportGate(result) }
+        )
+    }
+
+    private fun finishExportGate(result: Result<com.privacyhub.pro.ProGateResult>) {
+        backupOperationInFlight = false
+        val gate = result.getOrElse { error ->
+            showFailure(error.message ?: "暂时无法验证 Pro 授权。")
+            return
+        }
         if (!gate.allowed) {
             val dialog = AlertDialog.Builder(this)
                 .setTitle(gate.title)
@@ -189,6 +213,7 @@ class BackupActivity : SecureActivity() {
                     return@setOnClickListener
                 }
                 pendingExportPassword = first.toCharArray()
+                backupOperationInFlight = true
                 password.text?.clear()
                 confirmation.text?.clear()
                 dialog.dismiss()
@@ -199,29 +224,70 @@ class BackupActivity : SecureActivity() {
     }
 
     private fun exportBackup(uriText: String, password: CharArray) {
-        Thread {
-            var plain: ByteArray? = null
-            try {
-                if (!proGate.check(ProFeature.BatchExport).allowed) {
-                    throw BackupFormatException("Pro 授权当前不可用。")
+        if (backupOperationInFlight.not()) backupOperationInFlight = true
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { VaultBackupRepository(app).createPayload() },
+            onResult = { owner, result ->
+                (owner as BackupActivity).continueExport(uriText, password, generation, result)
+            },
+            onDiscard = { password.fill('\u0000') }
+        )
+    }
+
+    private fun continueExport(
+        uriText: String,
+        password: CharArray,
+        generation: Long,
+        payloadResult: Result<BackupPayload>
+    ) {
+        val payload = payloadResult.getOrElse { error ->
+            backupOperationInFlight = false
+            password.fill('\u0000')
+            showFailure(error.message ?: "创建备份失败。")
+            return
+        }
+        val app = applicationContext
+        tasks.executeBackupIo(
+            generation,
+            task = {
+                var plain: ByteArray? = null
+                var encrypted: ByteArray? = null
+                try {
+                    if (!ProGate(app).check(ProFeature.BatchExport).allowed) {
+                        throw BackupFormatException("Pro 授权当前不可用。")
+                    }
+                    plain = BackupPayloadCodec.encode(payload)
+                    encrypted = EncryptedBackupCodec.encrypt(plain, password)
+                    app.contentResolver.openOutputStream(Uri.parse(uriText), "w")?.use { output ->
+                        output.write(encrypted)
+                        output.flush()
+                    } ?: throw BackupFormatException("无法创建备份文件。")
+                    ExportSummary(payload.items.size, payload.autofillCredentials.size)
+                } finally {
+                    plain?.fill(0)
+                    encrypted?.fill(0)
+                    password.fill('\u0000')
                 }
-                val payload = backupRepository.createPayload()
-                plain = BackupPayloadCodec.encode(payload)
-                val encrypted = EncryptedBackupCodec.encrypt(plain, password)
-                contentResolver.openOutputStream(android.net.Uri.parse(uriText), "w")?.use { output ->
-                    output.write(encrypted)
-                    output.flush()
-                } ?: throw BackupFormatException("无法创建备份文件。")
-                runOnUiThread {
-                    Toast.makeText(this, "已创建加密备份：${payload.items.size} 条内容，${payload.autofillCredentials.size} 条登录信息", Toast.LENGTH_LONG).show()
-                }
-            } catch (error: Exception) {
-                runOnUiThread { showFailure(error.message ?: "创建备份失败。") }
-            } finally {
-                plain?.fill(0)
-                password.fill('\u0000')
-            }
-        }.start()
+            },
+            onResult = { owner, result -> (owner as BackupActivity).finishExport(result) }
+        )
+    }
+
+    private fun finishExport(result: Result<ExportSummary>) {
+        backupOperationInFlight = false
+        result.fold(
+            onSuccess = { summary ->
+                Toast.makeText(
+                    this,
+                    "已创建加密备份：${summary.items} 条内容，${summary.credentials} 条登录信息",
+                    Toast.LENGTH_LONG
+                ).show()
+            },
+            onFailure = { error -> showFailure(error.message ?: "创建备份失败。") }
+        )
     }
 
     private fun showImportPasswordDialog() {
@@ -257,41 +323,14 @@ class BackupActivity : SecureActivity() {
                 readButton.isEnabled = false
                 cancelButton.isEnabled = false
                 dialog.setCancelable(false)
-                readBackup(attempt, value) { result ->
-                    if (isFinishing || isDestroyed || !dialog.isShowing) return@readBackup
-                    if (!backupImportSession.finishAttempt(attempt, result)) return@readBackup
-
-                    readButton.isEnabled = true
-                    cancelButton.isEnabled = true
-                    dialog.setCancelable(true)
-                    when (result) {
-                        is BackupImportReadResult.AuthenticationFailed -> {
-                            dialog.setMessage("备份口令错误，或备份文件已损坏，请重新输入后重试。")
-                            password.text?.clear()
-                            password.requestFocus()
-                            password.post {
-                                if (!isFinishing && !isDestroyed && dialog.isShowing) {
-                                    (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)
-                                        ?.showSoftInput(password, InputMethodManager.SHOW_IMPLICIT)
-                                }
-                            }
-                        }
-                        is BackupImportReadResult.Success -> {
-                            password.text?.clear()
-                            dialog.dismiss()
-                            showRestoreModeDialog(result.payload)
-                        }
-                        is BackupImportReadResult.Failure -> {
-                            password.text?.clear()
-                            dialog.dismiss()
-                            showFailure(result.message)
-                        }
-                    }
-                }
+                backupOperationInFlight = true
+                readBackup(attempt, value)
             }
 
             cancelButton.setOnClickListener {
                 backupImportSession.cancel()
+                tasks.invalidate()
+                backupOperationInFlight = false
                 password.text?.clear()
                 dialog.dismiss()
             }
@@ -309,21 +348,72 @@ class BackupActivity : SecureActivity() {
         dialog.show()
     }
 
-    private fun readBackup(
-        attempt: BackupImportAttempt,
-        password: CharArray,
-        onCompleted: (BackupImportReadResult) -> Unit
-    ) {
-        Thread {
-            val result = BackupImportReader.read(password) {
-                contentResolver.openInputStream(Uri.parse(attempt.uri))?.use(::readBackupBytes)
-                    ?: throw BackupFormatException("无法读取备份文件。")
+    private fun readBackup(attempt: BackupImportAttempt, password: CharArray) {
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeBackupIo(
+            generation,
+            task = {
+                BackupImportReader.read(
+                    password = password,
+                    readEncryptedBackup = {
+                        app.contentResolver.openInputStream(Uri.parse(attempt.uri))?.use(::readBackupBytes)
+                            ?: throw BackupFormatException("无法读取备份文件。")
+                    }
+                )
+            },
+            onResult = { owner, result ->
+                result.fold(
+                    onSuccess = { readResult -> (owner as BackupActivity).handleImportRead(attempt, readResult) },
+                    onFailure = { error ->
+                        (owner as BackupActivity).handleImportRead(
+                            attempt,
+                            BackupImportReadResult.Failure(error.message ?: "无法读取备份。")
+                        )
+                    }
+                )
             }
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                onCompleted(result)
+        )
+    }
+
+    private fun handleImportRead(attempt: BackupImportAttempt, result: BackupImportReadResult) {
+        val dialog = importPasswordDialog
+        if (dialog == null || !dialog.isShowing) {
+            backupImportSession.finishAttempt(attempt, result)
+            backupOperationInFlight = false
+            return
+        }
+        if (!backupImportSession.finishAttempt(attempt, result)) return
+        backupOperationInFlight = false
+        val password = importPasswordInput
+        val readButton = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+        val cancelButton = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+        readButton.isEnabled = true
+        cancelButton.isEnabled = true
+        dialog.setCancelable(true)
+        when (result) {
+            is BackupImportReadResult.AuthenticationFailed -> {
+                dialog.setMessage("备份口令错误，或备份文件已损坏，请重新输入后重试。")
+                password?.text?.clear()
+                password?.requestFocus()
+                password?.post {
+                    if (!isFinishing && !isDestroyed && dialog.isShowing) {
+                        (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)
+                            ?.showSoftInput(password, InputMethodManager.SHOW_IMPLICIT)
+                    }
+                }
             }
-        }.start()
+            is BackupImportReadResult.Success -> {
+                password?.text?.clear()
+                dialog.dismiss()
+                showRestoreModeDialog(result.payload)
+            }
+            is BackupImportReadResult.Failure -> {
+                password?.text?.clear()
+                dialog.dismiss()
+                showFailure(result.message)
+            }
+        }
     }
 
     private fun showRestoreModeDialog(payload: BackupPayload) {
@@ -347,35 +437,30 @@ class BackupActivity : SecureActivity() {
     }
 
     private fun restore(payload: BackupPayload, mode: RestoreMode) {
-        Thread {
-            try {
-                val result = backupRepository.restore(payload, mode)
-                pendingRestorePayload = null
-                runOnUiThread {
-                    Toast.makeText(
-                        this,
-                        "恢复完成：内容新增 ${result.insertedItems} 条、跳过 ${result.skippedItems} 条；登录信息新增 ${result.insertedCredentials} 条、跳过 ${result.skippedCredentials} 条",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            } catch (error: Exception) {
-                runOnUiThread { showFailure(error.message ?: "恢复失败。") }
-            }
-        }.start()
+        if (backupOperationInFlight) return
+        backupOperationInFlight = true
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { VaultBackupRepository(app).restore(payload, mode) },
+            onResult = { owner, result -> (owner as BackupActivity).finishRestore(result) }
+        )
     }
 
-    private fun readBackupBytes(input: java.io.InputStream): ByteArray {
-        val output = ByteArrayOutputStream()
-        val buffer = ByteArray(8 * 1024)
-        while (true) {
-            val read = input.read(buffer)
-            if (read == -1) break
-            if (output.size() + read > MAX_BACKUP_FILE_BYTES) {
-                throw BackupFormatException("备份文件过大。")
-            }
-            output.write(buffer, 0, read)
-        }
-        return output.toByteArray()
+    private fun finishRestore(result: Result<com.privacyhub.backup.RestoreResult>) {
+        backupOperationInFlight = false
+        pendingRestorePayload = null
+        result.fold(
+            onSuccess = { restoreResult ->
+                Toast.makeText(
+                    this,
+                    "恢复完成：内容新增 ${restoreResult.insertedItems} 条、跳过 ${restoreResult.skippedItems} 条；登录信息新增 ${restoreResult.insertedCredentials} 条、跳过 ${restoreResult.skippedCredentials} 条",
+                    Toast.LENGTH_LONG
+                ).show()
+            },
+            onFailure = { error -> showFailure(error.message ?: "恢复失败。") }
+        )
     }
 
     private fun showFailure(message: String) {
@@ -463,8 +548,37 @@ class BackupActivity : SecureActivity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
+    private data class ExportSummary(val items: Int, val credentials: Int)
+
     companion object {
         private const val BACKUP_MIME_TYPE = "application/vnd.privacyhub.backup"
-        private const val MAX_BACKUP_FILE_BYTES = 33 * 1024 * 1024
+    }
+}
+
+private const val MAX_BACKUP_FILE_BYTES = 33 * 1024 * 1024
+
+private fun readBackupBytes(input: InputStream): ByteArray {
+    val output = WipingByteArrayOutputStream()
+    val buffer = ByteArray(8 * 1024)
+    try {
+        while (true) {
+            val read = input.read(buffer)
+            if (read == -1) break
+            if (output.size() + read > MAX_BACKUP_FILE_BYTES) {
+                throw BackupFormatException("备份文件过大。")
+            }
+            output.write(buffer, 0, read)
+        }
+        return output.toByteArray()
+    } finally {
+        buffer.fill(0)
+        output.clear()
+    }
+}
+
+private class WipingByteArrayOutputStream : ByteArrayOutputStream() {
+    fun clear() {
+        buf.fill(0)
+        reset()
     }
 }

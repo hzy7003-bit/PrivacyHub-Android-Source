@@ -15,20 +15,42 @@ import com.privacyhub.presentation.pro.ProLicenseActivity
 import com.privacyhub.presentation.security.SecureActivity
 import com.privacyhub.presentation.ui.ButtonKind
 import com.privacyhub.presentation.ui.FrostedUi
+import com.privacyhub.pro.ProGateResult
 import com.privacyhub.pro.ProFeature
 import com.privacyhub.pro.ProGate
+import com.privacyhub.util.ActivityTaskScope
 
 class NetdiskAutomationSettingsActivity : SecureActivity() {
     private val settingsStore by lazy { AppSettingsStore(this) }
-    private val proGate by lazy { ProGate(this) }
+    private val tasks by lazy { ActivityTaskScope(this) }
+    private var toggleInFlight = false
 
     override fun onSecureCreate(savedInstanceState: Bundle?) = Unit
 
     override fun onUnlocked() {
-        render()
+        // A pending toggle shares this task scope and must retain its completion callback.
+        if (toggleInFlight) return
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { ProGate(app).check(ProFeature.AccessibilityAutomation) },
+            onResult = { owner, result ->
+                val activity = owner as NetdiskAutomationSettingsActivity
+                val gate = result.getOrElse { error ->
+                    ProGateResult(false, "暂时无法验证 Pro 授权", error.message ?: "请稍后重试。")
+                }
+                activity.render(gate)
+            }
+        )
     }
 
-    private fun render() {
+    override fun onDestroy() {
+        tasks.close()
+        super.onDestroy()
+    }
+
+    private fun render(gate: ProGateResult) {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             FrostedUi.applyPageChrome(this)
@@ -41,7 +63,6 @@ class NetdiskAutomationSettingsActivity : SecureActivity() {
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val gate = proGate.check(ProFeature.AccessibilityAutomation)
         content.addView(card(
             "Pro 授权",
             if (gate.allowed) "当前授权可使用网盘自动填码。" else gate.message,
@@ -71,13 +92,7 @@ class NetdiskAutomationSettingsActivity : SecureActivity() {
             if (masterEnabled) "关闭自动填码" else "允许自动填码",
             if (masterEnabled) ButtonKind.Secondary else ButtonKind.Primary
         ) {
-            if (!masterEnabled && !gate.allowed) {
-                Toast.makeText(this, gate.message, Toast.LENGTH_SHORT).show()
-                startActivity(Intent(this, ProLicenseActivity::class.java))
-                return@card
-            }
-            settingsStore.setNetdiskAutomationEnabled(!masterEnabled)
-            render()
+            toggleAutomation(masterEnabled, gate)
         })
 
         content.addView(card(
@@ -90,6 +105,46 @@ class NetdiskAutomationSettingsActivity : SecureActivity() {
 
         root.addView(button("返回", ButtonKind.Secondary) { finish() })
         setContentView(root)
+    }
+
+    private fun toggleAutomation(masterEnabled: Boolean, displayedGate: ProGateResult) {
+        if (toggleInFlight) return
+        toggleInFlight = true
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = {
+                val store = AppSettingsStore(app)
+                val current = store.isNetdiskAutomationEnabled()
+                if (current != masterEnabled) {
+                    return@executeDisk ToggleAutomationResult(current)
+                }
+                val gate = if (current) displayedGate else ProGate(app).check(ProFeature.AccessibilityAutomation)
+                if (!current && !gate.allowed) {
+                    return@executeDisk ToggleAutomationResult(current, deniedGate = gate)
+                }
+                store.setNetdiskAutomationEnabled(!current)
+                ToggleAutomationResult(!current)
+            },
+            onResult = { owner, result ->
+                val activity = owner as NetdiskAutomationSettingsActivity
+                activity.toggleInFlight = false
+                result.fold(
+                    onSuccess = { toggle ->
+                        if (toggle.deniedGate != null) {
+                            Toast.makeText(activity, toggle.deniedGate.message, Toast.LENGTH_SHORT).show()
+                            activity.startActivity(Intent(activity, ProLicenseActivity::class.java))
+                        } else {
+                            activity.onUnlocked()
+                        }
+                    },
+                    onFailure = { error ->
+                        Toast.makeText(activity, error.message ?: "无法更改自动填码设置", Toast.LENGTH_LONG).show()
+                    }
+                )
+            }
+        )
     }
 
     private fun card(
@@ -132,4 +187,9 @@ class NetdiskAutomationSettingsActivity : SecureActivity() {
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private data class ToggleAutomationResult(
+        val enabled: Boolean,
+        val deniedGate: ProGateResult? = null
+    )
 }

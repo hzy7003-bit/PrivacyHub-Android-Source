@@ -6,6 +6,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import java.lang.ref.WeakReference
 import com.privacyhub.automation.NetdiskAccessibilityStatus
 import com.privacyhub.automation.NetdiskAccessCodeTaskController
 import com.privacyhub.automation.NetdiskHostPolicy
@@ -24,6 +25,7 @@ import com.privacyhub.router.AppIntentRouter
 import com.privacyhub.router.BrowserFallback
 import com.privacyhub.router.LinkParser
 import com.privacyhub.router.OpenResult
+import com.privacyhub.util.AppExecutors
 
 internal class VaultLinkActionPanelFactory(
     private val activity: Activity,
@@ -80,12 +82,36 @@ internal class VaultLinkActionPanelFactory(
     }
 
     private fun openAndFillAccessCode(item: VaultItem, url: String?, accessCode: String) {
-        val gate = ProGate(activity).check(ProFeature.AccessibilityAutomation)
-        if (!gate.allowed) {
-            Toast.makeText(activity, gate.message, Toast.LENGTH_SHORT).show()
-            activity.startActivity(Intent(activity, ProLicenseActivity::class.java))
-            return
-        }
+        val factoryRef = WeakReference(this)
+        val app = activity.applicationContext
+        AppExecutors.executeDiskResult(
+            task = { ProGate(app).check(ProFeature.AccessibilityAutomation) },
+            onResult = { result ->
+                val factory = factoryRef.get() ?: return@executeDiskResult
+                if (factory.activity.isFinishing || factory.activity.isDestroyed) return@executeDiskResult
+                result.fold(
+                    onSuccess = { gate ->
+                        if (!gate.allowed) {
+                            Toast.makeText(factory.activity, gate.message, Toast.LENGTH_SHORT).show()
+                            factory.activity.startActivity(Intent(factory.activity, ProLicenseActivity::class.java))
+                        } else {
+                            factory.continueOpenAndFillAccessCode(item, url, accessCode)
+                        }
+                    },
+                    onFailure = { error ->
+                        Toast.makeText(
+                            factory.activity,
+                            error.message ?: "暂时无法验证 Pro 授权",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                )
+            }
+        )
+    }
+
+    private fun continueOpenAndFillAccessCode(item: VaultItem, url: String?, accessCode: String) {
+        val activity = activity
         if (!settingsStore.isNetdiskAutomationEnabled()) {
             Toast.makeText(activity, "请先开启网盘自动填码", Toast.LENGTH_SHORT).show()
             activity.startActivity(Intent(activity, NetdiskAutomationSettingsActivity::class.java))
@@ -129,7 +155,10 @@ internal class VaultLinkActionPanelFactory(
     }
 
     private fun recordAutomationFailure(item: VaultItem, reason: String?, note: String) {
-        store.recordReport(EntryPoint.AUTOMATION, false, reason, item.target, note)
+        val target = item.target
+        AppExecutors.executeDisk {
+            runCatching { store.recordReport(EntryPoint.AUTOMATION, false, reason, target, note) }
+        }
     }
 
     private fun savedLink(item: VaultItem): String? {
@@ -141,13 +170,14 @@ internal class VaultLinkActionPanelFactory(
     private fun openSavedLink(item: VaultItem, url: String?) {
         val result = AppIntentRouter.openTargetAppThenFallback(activity, url, item.target, currentContent())
         if (result.success) onOpened()
-        store.recordReport(
-            item.entryPoint,
-            result.success,
-            result.failureReason,
-            item.target,
-            result.routeNote ?: "从安全箱详情打开已保存链接"
-        )
+        val entryPoint = item.entryPoint
+        val success = result.success
+        val failure = result.failureReason
+        val target = item.target
+        val note = result.routeNote ?: "从安全箱详情打开已保存链接"
+        AppExecutors.executeDisk {
+            runCatching { store.recordReport(entryPoint, success, failure, target, note) }
+        }
         Toast.makeText(activity, toastForOpenResult(result), Toast.LENGTH_SHORT).show()
     }
 

@@ -64,24 +64,43 @@ open class ShareReceiverActivity : Activity() {
     }
 
     private fun saveIncoming() {
-        val text = when (intent.action) {
-            Intent.ACTION_PROCESS_TEXT -> intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()
-            Intent.ACTION_SEND, ACTION_MANUAL -> intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
-            else -> null
-        }.orEmpty().trim()
-        if (text.isBlank()) {
-            showStatus("没有收到文本", "请在来源 App 分享文本，或返回中转页手动输入。", retry = false)
-            val app = applicationContext
-            AppExecutors.executeDisk { runCatching {
-                LocalStore(app).recordReport(EntryPoint.SHARE, false, "未收到可处理的文本", null, "文本入口接收失败")
-            } }
-            return
+        val input = ShareTextInputPolicy.read(intent.action, intent.type) {
+            @Suppress("DEPRECATION")
+            when (intent.action) {
+                Intent.ACTION_PROCESS_TEXT -> intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)
+                Intent.ACTION_SEND, ACTION_MANUAL -> intent.getCharSequenceExtra(Intent.EXTRA_TEXT)
+                else -> null
+            }
         }
+        val accepted = when (input) {
+            is ShareTextInputResult.Accepted -> input
+            ShareTextInputResult.MissingText -> {
+                showStatus("没有收到文本", "请在来源 App 分享文本，或返回中转页手动输入。", retry = false)
+                return
+            }
+            ShareTextInputResult.UnsupportedAction -> {
+                showStatus("不支持的输入方式", "请通过系统分享、长按文本或中转页手动输入传入文本。")
+                return
+            }
+            ShareTextInputResult.UnsupportedType -> {
+                showStatus("只支持文本", "请分享纯文本内容，文件和其他类型不会保存。")
+                return
+            }
+            ShareTextInputResult.TooLong -> {
+                showStatus("分享内容过长", "本次内容未保存。请缩短后重新分享，单次最多约 13 万字符。")
+                return
+            }
+            ShareTextInputResult.Malformed -> {
+                showStatus("无法读取分享内容", "本次内容未保存。请从来源 App 重新分享文本。")
+                return
+            }
+        }
+        val text = accepted.text
         receipt.started = true
         val currentReceipt = receipt
         val app = applicationContext
         val source = callingPackage ?: referrer?.host ?: "unknown"
-        val entry = if (intent.action == ACTION_MANUAL) EntryPoint.MANUAL else EntryPoint.SHARE
+        val entry = if (accepted.action == ACTION_MANUAL) EntryPoint.MANUAL else EntryPoint.SHARE
         AppExecutors.executeDisk {
             val result = runCatching {
                 val store = LocalStore(app)
@@ -136,7 +155,7 @@ open class ShareReceiverActivity : Activity() {
     }
 
     companion object {
-        const val ACTION_MANUAL = "com.privacyhub.action.TRANSFER_TEXT"
+        const val ACTION_MANUAL = ShareTextInputPolicy.ACTION_MANUAL
         private const val KEY_SAVED_ID = "saved_item_id"
     }
 }

@@ -13,12 +13,20 @@ import com.privacyhub.data.settings.AppSettingsStore
 import com.privacyhub.presentation.security.SecureActivity
 import com.privacyhub.presentation.ui.ButtonKind
 import com.privacyhub.presentation.ui.FrostedUi
+import com.privacyhub.util.ActivityTaskScope
 
 class CategoryManagementActivity : SecureActivity() {
-    private val store by lazy { LocalStore(this) }
+    private val tasks by lazy { ActivityTaskScope(this) }
+    private var operationInFlight = false
 
     override fun onUnlocked() {
+        if (operationInFlight) return
         render()
+    }
+
+    override fun onDestroy() {
+        tasks.close()
+        super.onDestroy()
     }
 
     private fun render() {
@@ -29,13 +37,50 @@ class CategoryManagementActivity : SecureActivity() {
         root.addView(title("分类管理"))
         root.addView(subtitle("管理分类名称和自动识别映射。整理分类不会删除安全箱内容。"))
 
-        store.categorySettingsReadError()?.let { message ->
-            root.addView(emptyText(message))
+        root.addView(emptyText("正在读取分类…"))
+        root.addView(fullWidthButton("返回设置", ButtonKind.Secondary) {
+            finish()
+        })
+        setContentView(root)
+
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = {
+                val localStore = LocalStore(app)
+                val readError = localStore.categorySettingsReadError()
+                CategoryState(
+                    readError = readError,
+                    customCategories = if (readError == null) {
+                        localStore.categories().filterNot(localStore::isSystemCategory)
+                    } else emptyList()
+                )
+            },
+            onResult = { owner, result -> (owner as CategoryManagementActivity).renderCategories(result) }
+        )
+    }
+
+    private fun renderCategories(result: Result<CategoryState>) {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            FrostedUi.applyPageChrome(this)
+            addView(title("分类管理"))
+            addView(subtitle("管理分类名称和自动识别映射。整理分类不会删除安全箱内容。"))
+        }
+        val state = result.getOrElse { error ->
+            root.addView(emptyText(error.message ?: "原有数据未更改，请重试。"))
+            root.addView(fullWidthButton("重试", ButtonKind.Primary) { render() })
             root.addView(fullWidthButton("返回设置", ButtonKind.Secondary) { finish() })
             setContentView(root)
             return
         }
-
+        if (state.readError != null) {
+            root.addView(emptyText(state.readError))
+            root.addView(fullWidthButton("返回设置", ButtonKind.Secondary) { finish() })
+            setContentView(root)
+            return
+        }
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -43,30 +88,17 @@ class CategoryManagementActivity : SecureActivity() {
         }
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-
-        content.addView(fullWidthButton("新增自定义标签", ButtonKind.Primary) {
-            showAddCategoryDialog()
-        })
-
+        content.addView(fullWidthButton("新增自定义标签", ButtonKind.Primary) { showAddCategoryDialog() })
         content.addView(sectionTitle("已有标签"))
-        val customCategories = store.categories().filterNot(store::isSystemCategory)
-        if (customCategories.isEmpty()) {
+        if (state.customCategories.isEmpty()) {
             content.addView(emptyText("还没有自定义标签。系统标签会自动存在，不需要手动创建。"))
         } else {
-            customCategories.forEach { category ->
-                content.addView(customCategoryCard(category))
-            }
+            state.customCategories.forEach { content.addView(customCategoryCard(it)) }
         }
-
         content.addView(sectionTitle("系统自动识别标签"))
         content.addView(emptyText("这些标签由本地识别规则生成，不能删除。你可以改成自己习惯的名称。"))
-        AppSettingsStore.DEFAULT_CATEGORIES.forEach { category ->
-            content.addView(systemCategoryCard(category))
-        }
-
-        root.addView(fullWidthButton("返回设置", ButtonKind.Secondary) {
-            finish()
-        })
+        AppSettingsStore.DEFAULT_CATEGORIES.forEach { content.addView(systemCategoryCard(it)) }
+        root.addView(fullWidthButton("返回设置", ButtonKind.Secondary) { finish() })
         setContentView(root)
     }
 
@@ -101,12 +133,14 @@ class CategoryManagementActivity : SecureActivity() {
             initialValue = "",
             positiveText = "新增"
         ) { name ->
-            if (store.addCategory(name)) {
-                Toast.makeText(this, "已新增标签", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, "标签已存在、属于系统标签，或名称为空", Toast.LENGTH_SHORT).show()
-            }
-            render()
+            val app = applicationContext
+            runOperation(
+                task = { LocalStore(app).addCategory(name) },
+                onSuccess = { activity, added ->
+                    Toast.makeText(activity, if (added) "已新增标签" else "标签已存在、属于系统标签，或名称为空", Toast.LENGTH_SHORT).show()
+                    activity.render()
+                }
+            )
         }
     }
 
@@ -120,9 +154,14 @@ class CategoryManagementActivity : SecureActivity() {
                 Toast.makeText(this, "标签名称不能为空", Toast.LENGTH_SHORT).show()
                 return@showCategoryNameDialog
             }
-            store.renameCategory(oldName, newName)
-            Toast.makeText(this, "已更新标签", Toast.LENGTH_SHORT).show()
-            render()
+            val app = applicationContext
+            runOperation(
+                task = { LocalStore(app).renameCategory(oldName, newName) },
+                onSuccess = { activity, _ ->
+                    Toast.makeText(activity, "已更新标签", Toast.LENGTH_SHORT).show()
+                    activity.render()
+                }
+            )
         }
     }
 
@@ -132,11 +171,39 @@ class CategoryManagementActivity : SecureActivity() {
             .setMessage("确定把“$category”下的内容移入“其他”？内容不会删除，只是不再属于这个标签。")
             .setNegativeButton("取消", null)
             .setPositiveButton("移入其他") { _, _ ->
-                val count = store.moveCategory(category, "其他")
-                store.deleteCustomCategory(category)
-                Toast.makeText(this, "已移入“其他”：$count 条", Toast.LENGTH_SHORT).show()
-                render()
+                val app = applicationContext
+                runOperation(
+                    task = { LocalStore(app).let { localStore ->
+                        localStore.moveCategoryAndRemoveCustomSource(category, "其他")
+                    } },
+                    onSuccess = { activity, count ->
+                        Toast.makeText(activity, "已移入“其他”：$count 条", Toast.LENGTH_SHORT).show()
+                        activity.render()
+                    }
+                )
             }
+            .show()
+    }
+
+    private fun <R> runOperation(task: () -> R, onSuccess: (CategoryManagementActivity, R) -> Unit) {
+        if (operationInFlight) return
+        operationInFlight = true
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(generation, task, onResult = { owner, result ->
+            val activity = owner as CategoryManagementActivity
+            activity.operationInFlight = false
+            result.fold(
+                onSuccess = { onSuccess(activity, it) },
+                onFailure = { activity.showOperationFailure(it) }
+            )
+        })
+    }
+
+    private fun showOperationFailure(error: Throwable) {
+        AlertDialog.Builder(this)
+            .setTitle("操作未完成")
+            .setMessage(error.message ?: "原有数据未更改，请重试。")
+            .setPositiveButton("知道了", null)
             .show()
     }
 
@@ -233,4 +300,6 @@ class CategoryManagementActivity : SecureActivity() {
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private data class CategoryState(val readError: String?, val customCategories: List<String>)
 }

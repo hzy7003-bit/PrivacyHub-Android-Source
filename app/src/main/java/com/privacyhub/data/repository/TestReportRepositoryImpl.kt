@@ -2,6 +2,7 @@ package com.privacyhub.data.repository
 
 import android.content.Context
 import com.privacyhub.data.db.PrivacyHubDatabaseProvider
+import com.privacyhub.data.db.DatabaseAccessCoordinator
 import com.privacyhub.data.db.entity.TestReportEntity
 import com.privacyhub.data.mapper.VaultItemMapper
 import com.privacyhub.diagnostics.DiagnosticNotePolicy
@@ -11,7 +12,10 @@ import com.privacyhub.domain.model.LinkTarget
 import com.privacyhub.domain.model.TestReport
 
 class TestReportRepositoryImpl(context: Context) {
-    private val dao = PrivacyHubDatabaseProvider.get(context).testReportDao()
+    private val appContext = context.applicationContext
+    private val dao by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        PrivacyHubDatabaseProvider.get(appContext).testReportDao()
+    }
 
     fun record(
         entryPoint: EntryPoint,
@@ -20,28 +24,32 @@ class TestReportRepositoryImpl(context: Context) {
         target: LinkTarget?,
         note: String
     ): Long {
-        val device = DeviceInfoProvider.current()
-        val safeText = diagnosticTextForPersistence(failureReason, note)
-        return dao.insert(
-            TestReportEntity(
-                createdAtMillis = System.currentTimeMillis(),
-                entryPoint = entryPoint.name,
-                androidVersion = device.androidVersion,
-                sdkInt = device.sdkInt,
-                brand = device.brand,
-                manufacturer = device.manufacturer,
-                model = device.model,
-                rom = device.rom,
-                success = success,
-                failureReason = safeText.failureReason,
-                target = target?.name,
-                note = safeText.note
+        return DatabaseAccessCoordinator.withDatabaseAccess {
+            val device = DeviceInfoProvider.current()
+            val safeText = diagnosticTextForPersistence(failureReason, note)
+            dao.insert(
+                TestReportEntity(
+                    createdAtMillis = System.currentTimeMillis(),
+                    entryPoint = entryPoint.name,
+                    androidVersion = device.androidVersion,
+                    sdkInt = device.sdkInt,
+                    brand = device.brand,
+                    manufacturer = device.manufacturer,
+                    model = device.model,
+                    rom = device.rom,
+                    success = success,
+                    failureReason = safeText.failureReason,
+                    target = target?.name,
+                    note = safeText.note
+                )
             )
-        )
+        }
     }
 
     fun recent(limit: Int): List<TestReport> {
-        return dao.recent(limit).map(VaultItemMapper::toTestReport)
+        return DatabaseAccessCoordinator.withDatabaseAccess {
+            dao.recent(limit).map(VaultItemMapper::toTestReport)
+        }
     }
 }
 

@@ -35,9 +35,12 @@ import com.privacyhub.router.LinkParser
 import com.privacyhub.router.LinkTargetDetector
 import com.privacyhub.router.NetdiskAccessCodeParser
 import com.privacyhub.util.Formatters
+import com.privacyhub.util.ActivityTaskScope
+import com.privacyhub.util.SingleFlightGate
 
 class VaultDetailActivity : SecureActivity() {
     private val store by lazy { LocalStore(this) }
+    private val tasks by lazy { ActivityTaskScope(this) }
     private val settingsStore by lazy { AppSettingsStore(this) }
     private var itemId: Long = 0L
     private var createMode: Boolean = false
@@ -55,6 +58,8 @@ class VaultDetailActivity : SecureActivity() {
     private val views by lazy { PorcelainViews(this) }
     private var editing = false
     private var formVisible = false
+    private val operationGate = SingleFlightGate()
+    private var saveButton: Button? = null
 
     override fun onSecureCreate(savedInstanceState: Bundle?) {
         itemId = savedInstanceState?.getLong(EXTRA_ITEM_ID) ?: intent.getLongExtra(EXTRA_ITEM_ID, 0L)
@@ -82,8 +87,49 @@ class VaultDetailActivity : SecureActivity() {
     }
 
     override fun onUnlocked() {
-        item = if (createMode) null else store.getItem(itemId)
-        render()
+        if (operationGate.isAcquired()) return
+        if (createMode) {
+            item = null
+            render()
+            return
+        }
+        loadItem()
+    }
+
+    override fun onDestroy() {
+        tasks.close()
+        super.onDestroy()
+    }
+
+    private fun loadItem() {
+        val generation = tasks.nextGeneration()
+        val id = itemId
+        val app = applicationContext
+        setContentView(views.column().apply {
+            FrostedUi.applyPageChrome(this)
+            addView(views.title("正在读取安全箱…"))
+        })
+        tasks.executeDisk(
+            generation,
+            task = { LocalStore(app).getItem(id) },
+            onResult = { owner, result ->
+                val activity = owner as VaultDetailActivity
+                result.fold(
+                    { loaded -> activity.item = loaded; activity.render() },
+                    { error -> activity.showDataFailure(error) }
+                )
+            }
+        )
+    }
+
+    private fun showDataFailure(error: Throwable) {
+        setContentView(views.column().apply {
+            FrostedUi.applyPageChrome(this)
+            addView(views.title("暂时无法读取安全箱"))
+            addView(views.text(error.message ?: "原有数据未更改，请重试。", muted = true))
+            addView(views.button("重试") { loadItem() })
+            addView(views.button("返回") { finish() })
+        })
     }
 
     private fun render() {
@@ -158,8 +204,9 @@ class VaultDetailActivity : SecureActivity() {
         val actions = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        actions.addView(tonalButton(if (createMode) "保存到安全箱" else "保存修改") { save() }
-            .withVerticalMargins(bottomDp = UiMetrics.Small))
+        saveButton = tonalButton(if (createMode) "保存到安全箱" else "保存修改") { save() }
+            .withVerticalMargins(bottomDp = UiMetrics.Small)
+        actions.addView(saveButton)
         actions.addView(outlinedButton("取消编辑") { leaveEditor() })
         form.addView(actions)
         scroll.setPadding(0, 0, 0, dp(UiMetrics.Content))
@@ -318,8 +365,26 @@ class VaultDetailActivity : SecureActivity() {
                 editing = true; draftModel.draft = null; render()
             }.withVerticalMargins(bottomDp = UiMetrics.Small))
             addView(outlinedButton(if (current.favorite) "取消收藏" else "收藏") {
-                store.setFavorite(current.id, !current.favorite)
-                item = store.getItem(itemId); render()
+                if (!operationGate.tryAcquire()) return@outlinedButton
+                val generation = tasks.nextGeneration()
+                val app = applicationContext
+                val id = current.id
+                val favorite = !current.favorite
+                tasks.executeDisk(
+                    generation,
+                    task = { LocalStore(app).let { localStore ->
+                        localStore.setFavorite(id, favorite)
+                        localStore.getItem(id)
+                    } },
+                    onResult = { owner, result ->
+                        val activity = owner as VaultDetailActivity
+                        activity.operationGate.release()
+                        result.fold(
+                            { loaded -> activity.item = loaded; activity.render() },
+                            { error -> activity.showOperationFailure(error) }
+                        )
+                    }
+                )
             })
         })
         // Existing copy extraction stays in the shared factory, reading the saved content.
@@ -410,6 +475,7 @@ class VaultDetailActivity : SecureActivity() {
     }
 
     private fun save() {
+        if (operationGate.isAcquired()) return
         val content = contentInput.text?.toString().orEmpty().trim()
         if (content.isBlank()) {
             Toast.makeText(this, "请先填写要保存的内容", Toast.LENGTH_SHORT).show()
@@ -422,33 +488,69 @@ class VaultDetailActivity : SecureActivity() {
             return
         }
         if (createMode) {
-            itemId = store.saveManualItem(
-                title = titleInput.text?.toString().orEmpty().trim(),
-                content = content,
-                category = categoryInput.text?.toString().orEmpty().trim(),
-                note = noteInput.text?.toString().orEmpty().trim()
+            val app = applicationContext
+            val saveTitle = titleInput.text?.toString().orEmpty().trim()
+            val saveCategory = categoryInput.text?.toString().orEmpty().trim()
+            val saveNote = noteInput.text?.toString().orEmpty().trim()
+            if (!operationGate.tryAcquire()) return
+            saveButton?.isEnabled = false
+            val generation = tasks.nextGeneration()
+            tasks.executeDisk(
+                generation,
+                task = {
+                    LocalStore(app).saveManualItem(saveTitle, content, saveCategory, saveNote)
+                },
+                onResult = { owner, result ->
+                    val activity = owner as VaultDetailActivity
+                    activity.operationGate.release()
+                    activity.saveButton?.isEnabled = true
+                    result.fold(
+                        { id ->
+                            activity.itemId = id
+                            activity.createMode = false
+                            activity.editing = false
+                            activity.draftModel.draft = null
+                            Toast.makeText(activity, "已保存到安全箱", Toast.LENGTH_SHORT).show()
+                            activity.loadItem()
+                        },
+                        { error -> activity.showOperationFailure(error) }
+                    )
+                }
             )
-            createMode = false
-            editing = false
-            draftModel.draft = null
-            Toast.makeText(this, "已保存到安全箱", Toast.LENGTH_SHORT).show()
-            item = store.getItem(itemId)
-            render()
             return
         }
-        store.updateItem(
-            id = itemId,
-            title = titleInput.text?.toString().orEmpty().trim(),
-            content = content,
-            accessCode = accessCode.ifBlank { null },
-            category = categoryInput.text?.toString().orEmpty().trim(),
-            note = noteInput.text?.toString().orEmpty().trim()
+        val localStore = store
+        val app = applicationContext
+        val id = itemId
+        val saveTitle = titleInput.text?.toString().orEmpty().trim()
+        val saveCategory = categoryInput.text?.toString().orEmpty().trim()
+        val saveNote = noteInput.text?.toString().orEmpty().trim()
+        val saveAccessCode = accessCode.ifBlank { null }
+        if (!operationGate.tryAcquire()) return
+        saveButton?.isEnabled = false
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = {
+                localStore.updateItem(id, saveTitle, content, saveAccessCode, saveCategory, saveNote)
+                localStore.getItem(id)
+            },
+            onResult = { owner, result ->
+                val activity = owner as VaultDetailActivity
+                activity.operationGate.release()
+                activity.saveButton?.isEnabled = true
+                result.fold(
+                    { updated ->
+                        Toast.makeText(activity, "已保存", Toast.LENGTH_SHORT).show()
+                        activity.editing = false
+                        activity.draftModel.draft = null
+                        activity.item = updated
+                        activity.render()
+                    },
+                    { error -> activity.showOperationFailure(error) }
+                )
+            }
         )
-        Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
-        editing = false
-        draftModel.draft = null
-        item = store.getItem(itemId)
-        render()
     }
 
     private fun confirmDelete() {
@@ -462,9 +564,34 @@ class VaultDetailActivity : SecureActivity() {
     }
 
     private fun delete() {
-        store.deleteItem(itemId)
-        Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
-        finish()
+        if (!operationGate.tryAcquire()) return
+        val app = applicationContext
+        val id = itemId
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { LocalStore(app).deleteItem(id) },
+            onResult = { owner, result ->
+                val activity = owner as VaultDetailActivity
+                activity.operationGate.release()
+                result.fold(
+                    {
+                        Toast.makeText(activity, "已删除", Toast.LENGTH_SHORT).show()
+                        activity.finish()
+                    },
+                    { error -> activity.showOperationFailure(error) }
+                )
+            }
+        )
+    }
+
+    private fun showOperationFailure(error: Throwable) {
+        saveButton?.isEnabled = true
+        AlertDialog.Builder(this)
+            .setTitle("操作未完成")
+            .setMessage(error.message ?: "原有数据未更改，请重试。")
+            .setPositiveButton("知道了", null)
+            .show()
     }
 
     private fun input(

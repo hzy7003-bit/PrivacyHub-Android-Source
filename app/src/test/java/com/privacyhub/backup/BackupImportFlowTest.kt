@@ -121,6 +121,47 @@ class BackupImportFlowTest {
     }
 
     @Test
+    fun importReaderClearsPlaintextBufferAfterDecoding() {
+        val password = PASSWORD.toCharArray()
+        val encrypted = byteArrayOf(8, 9)
+        val plaintext = byteArrayOf(1, 2, 3)
+        val result = BackupImportReader.read(
+            password = password,
+            readEncryptedBackup = { encrypted },
+            decrypt = { _, _ -> plaintext },
+            decode = { payload() }
+        )
+
+        assertIs<BackupImportReadResult.Success>(result)
+        assertTrue(password.all { it == '\u0000' })
+        assertTrue(encrypted.all { it == 0.toByte() })
+        assertTrue(plaintext.all { it == 0.toByte() })
+    }
+
+    @Test
+    fun cancelledImportClearsSensitiveBuffersAndDropsTheStalePayloadResult() {
+        val session = BackupImportSession().apply { select(SELECTED_URI) }
+        val password = PASSWORD.toCharArray()
+        val encrypted = byteArrayOf(4, 5, 6)
+        val plaintext = byteArrayOf(7, 8, 9)
+        val attempt = assertNotNullAttempt(session.beginAttempt(password))
+
+        session.cancel()
+        val result = BackupImportReader.read(
+            password = password,
+            readEncryptedBackup = { encrypted },
+            decrypt = { _, _ -> plaintext },
+            decode = { payload() }
+        )
+
+        assertIs<BackupImportReadResult.Success>(result)
+        assertFalse(session.finishAttempt(attempt, result))
+        assertTrue(password.all { it == '\u0000' })
+        assertTrue(encrypted.all { it == 0.toByte() })
+        assertTrue(plaintext.all { it == 0.toByte() })
+    }
+
+    @Test
     fun onlyOneReadAttemptCanBeActiveAtATime() {
         val session = BackupImportSession()
         session.select(SELECTED_URI)

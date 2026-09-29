@@ -23,9 +23,9 @@ class PrivacyHubApp : Application() {
     private fun recoverPendingRestore() {
         try {
             VaultBackupRepository(this).recoverPendingRestore()
-        } catch (error: Exception) {
+        } catch (_: Exception) {
             // Keep the journal for a later retry; never treat an incomplete restore as successful.
-            Log.e(TAG, "Pending backup restore recovery is incomplete; it will be retried.", error)
+            Log.e(TAG, "restore_recovery_incomplete")
         }
     }
 

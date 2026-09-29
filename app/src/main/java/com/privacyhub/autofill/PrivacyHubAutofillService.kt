@@ -29,31 +29,32 @@ class PrivacyHubAutofillService : AutofillService() {
         cancellationSignal: CancellationSignal,
         callback: FillCallback
     ) {
-        if (!AppSettingsStore(this).isAutofillEnabled() ||
-            !ProGate(this).check(ProFeature.Autofill).allowed ||
-            cancellationSignal.isCanceled
-        ) {
-            callback.onSuccess(null)
-            return
-        }
-        val structure = request.fillContexts.lastOrNull()?.structure
-        if (structure == null) {
-            callback.onSuccess(null)
-            return
-        }
-        val requestScope = resolveAutofillRequestScope(structure, this)
-        if (requestScope == null) {
-            callback.onSuccess(null)
-            return
-        }
-        val packageName = requestScope.packageName
-        val fields = findLoginFields(structure)
-        if (fields.username == null && fields.password == null) {
-            recordIncompatiblePage(packageName, callback)
-            return
-        }
+        val app = applicationContext
         databaseExecutor.execute {
-            val credentials = AutofillCredentialRepository(this).all()
+            if (!AppSettingsStore(app).isAutofillEnabled() ||
+                !ProGate(app).check(ProFeature.Autofill).allowed ||
+                cancellationSignal.isCanceled
+            ) {
+                callback.onSuccess(null)
+                return@execute
+            }
+            val structure = request.fillContexts.lastOrNull()?.structure
+            if (structure == null) {
+                callback.onSuccess(null)
+                return@execute
+            }
+            val requestScope = resolveAutofillRequestScope(structure, app)
+            if (requestScope == null) {
+                callback.onSuccess(null)
+                return@execute
+            }
+            val packageName = requestScope.packageName
+            val fields = findLoginFields(structure)
+            if (fields.username == null && fields.password == null) {
+                recordIncompatiblePage(packageName, callback)
+                return@execute
+            }
+            val credentials = AutofillCredentialRepository(app).all()
                 .asSequence()
                 .filter { it.matchesAutofillScope(requestScope) }
                 .take(MAX_DATASETS)
@@ -62,7 +63,7 @@ class PrivacyHubAutofillService : AutofillService() {
                 callback.onSuccess(null)
                 return@execute
             }
-            val requiresAuthentication = AppSettingsStore(this).isSecurityLockEnabled()
+            val requiresAuthentication = AppSettingsStore(app).isSecurityLockEnabled()
             val response = FillResponse.Builder()
             credentials.forEach { credential ->
                 val presentation = RemoteViews(applicationContext.packageName, R.layout.autofill_dataset).apply {

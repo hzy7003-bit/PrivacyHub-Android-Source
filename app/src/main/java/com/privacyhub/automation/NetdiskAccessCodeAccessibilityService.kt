@@ -5,22 +5,60 @@ import android.os.Bundle
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.privacyhub.data.settings.AppSettingsStore
-import com.privacyhub.pro.ProFeature
 import com.privacyhub.pro.ProGate
+import com.privacyhub.pro.ProFeature
+import com.privacyhub.util.AppExecutors
 import java.util.ArrayDeque
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 class NetdiskAccessCodeAccessibilityService : AccessibilityService() {
     private val settingsStore by lazy { AppSettingsStore(this) }
+    private val proCheckInFlight = AtomicBoolean(false)
+    @Volatile private var serviceUsable = true
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        if (!settingsStore.isNetdiskAutomationEnabled() ||
-            !ProGate(this).check(ProFeature.AccessibilityAutomation).allowed
+        val packageName = event.packageName?.toString().orEmpty()
+        NetdiskAccessibilityEventPolicy.inspectSupportedBrowser(packageName) {
+            checkProThenInspect(packageName)
+        }
+    }
+
+    override fun onInterrupt() = Unit
+
+    override fun onDestroy() {
+        serviceUsable = false
+        super.onDestroy()
+    }
+
+    private fun checkProThenInspect(packageName: String) {
+        if (!serviceUsable ||
+            !settingsStore.isNetdiskAutomationEnabled() ||
+            !NetdiskAccessCodeTaskController.hasActiveTaskForPackage(packageName) ||
+            !proCheckInFlight.compareAndSet(false, true)
         ) {
             return
         }
-        val packageName = event.packageName?.toString().orEmpty()
-        val root = rootInActiveWindow ?: event.source ?: return
+        val app = applicationContext
+        AppExecutors.executeDiskResult(
+            task = { ProGate(app).check(ProFeature.AccessibilityAutomation).allowed },
+            onResult = { gateResult ->
+                proCheckInFlight.set(false)
+                if (!serviceUsable ||
+                    gateResult.getOrDefault(false).not() ||
+                    !settingsStore.isNetdiskAutomationEnabled() ||
+                    !NetdiskAccessCodeTaskController.hasActiveTaskForPackage(packageName)
+                ) {
+                    return@executeDiskResult
+                }
+                inspectCurrentWindow(packageName)
+            }
+        )
+    }
+
+    private fun inspectCurrentWindow(packageName: String) {
+        val root = rootInActiveWindow ?: return
+        if (root.packageName?.toString() != packageName) return
         val currentHost = currentBrowserHost(packageName, root) ?: return
         val task = NetdiskAccessCodeTaskController.matching(packageName, currentHost) ?: return
         val input = findAccessCodeInput(root) ?: return
@@ -32,8 +70,6 @@ class NetdiskAccessCodeAccessibilityService : AccessibilityService() {
             NetdiskAccessCodeTaskController.complete(applicationContext, task)
         }
     }
-
-    override fun onInterrupt() = Unit
 
     private fun currentBrowserHost(packageName: String, root: AccessibilityNodeInfo): String? {
         val candidates = mutableListOf<NetdiskAddressBarCandidate>()

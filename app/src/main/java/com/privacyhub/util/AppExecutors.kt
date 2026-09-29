@@ -2,16 +2,20 @@ package com.privacyhub.util
 
 import android.os.Handler
 import android.os.Looper
-import java.util.concurrent.Callable
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
-import java.util.concurrent.FutureTask
 
 object AppExecutors {
     private val diskExecutor = Executors.newSingleThreadExecutor()
+    /** Keeps long backup encryption/file operations from queueing behind ordinary database work. */
+    private val backupIoExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val resultDispatcher = ResultTaskDispatcher(
         workerExecutor = diskExecutor,
+        callbackExecutor = Executor { task -> mainHandler.post(task) }
+    )
+    private val backupIoResultDispatcher = ResultTaskDispatcher(
+        workerExecutor = backupIoExecutor,
         callbackExecutor = Executor { task -> mainHandler.post(task) }
     )
 
@@ -27,13 +31,12 @@ object AppExecutors {
         resultDispatcher.execute(task, onResult)
     }
 
-    fun <T> runDiskBlocking(task: () -> T): T {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            return task()
-        }
-        val future = FutureTask(Callable { task() })
-        diskExecutor.execute(future)
-        return future.get()
+    fun executeBackupIo(task: () -> Unit) {
+        backupIoExecutor.execute(task)
+    }
+
+    fun <T> executeBackupIoResult(task: () -> T, onResult: (Result<T>) -> Unit) {
+        backupIoResultDispatcher.execute(task, onResult)
     }
 }
 

@@ -3,7 +3,9 @@ package com.privacyhub.automation
 import com.privacyhub.domain.model.LinkTarget
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class NetdiskAccessCodeTaskRegistryTest {
     @Test
@@ -11,9 +13,12 @@ class NetdiskAccessCodeTaskRegistryTest {
         val registry = NetdiskAccessCodeTaskRegistry(timeoutMillis = 60_000L)
         val task = registry.start("aB9x", LinkTarget.BAIDU_NETDISK, "pan.baidu.com", "com.baidu.netdisk", nowMillis = 100L)
 
+        assertFalse(registry.hasActiveTaskForPackage("com.vivo.browser", nowMillis = 101L))
+        assertTrue(registry.hasActiveTaskForPackage("com.baidu.netdisk", nowMillis = 101L))
         assertNull(registry.match("com.vivo.browser", "pan.baidu.com", nowMillis = 101L))
         assertNull(registry.match("com.baidu.netdisk", null, nowMillis = 101L))
         assertEquals(task, registry.match("com.baidu.netdisk", "pan.baidu.com", nowMillis = 101L))
+        assertFalse(registry.hasActiveTaskForPackage("com.baidu.netdisk", nowMillis = 60_100L))
     }
 
     @Test
@@ -67,6 +72,7 @@ class NetdiskAccessCodeTaskRegistryTest {
         val registry = NetdiskAccessCodeTaskRegistry()
         val task = registry.start("aB9x", LinkTarget.BAIDU_NETDISK, "pan.baidu.com", "com.android.chrome", nowMillis = 100L)
 
+        // A wrong host never produces a fillable task, so the service cannot reach ACTION_SET_TEXT.
         assertNull(registry.match("com.android.chrome", "example.com", nowMillis = 101L))
         assertNull(registry.match("com.android.chrome", "pan.baidu.com", nowMillis = 102L))
         assertEquals(null, registry.complete(task.id))

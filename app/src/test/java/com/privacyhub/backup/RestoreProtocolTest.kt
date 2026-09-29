@@ -169,6 +169,197 @@ class RestoreProtocolTest {
         assertTrue(journalText.contains("operation-1"))
     }
 
+    @Test
+    fun coordinatedRenameCommitsRoomAndSettingsTogether() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "旧分类" }
+        val settings = FakeSettings(oldSettings)
+        val protocol = protocol(database, settings)
+
+        val count = protocol.runCoordinatedMutation(
+            applyRoom = { database.categoryRows["item"] = "新分类"; 1 },
+            applySettings = { settings.current = newSettings; true }
+        )
+
+        assertEquals(1, count)
+        assertEquals("新分类", database.categoryRows["item"])
+        assertEquals(newSettings, settings.current)
+        assertNull(database.journal)
+        assertNull(settings.staged)
+    }
+
+    @Test
+    fun renameRoomFailureRollsBackAndPreservesItemCategory() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "旧分类" }
+        val settings = FakeSettings(oldSettings)
+        val protocol = protocol(database, settings)
+
+        assertFailsWith<IllegalStateException> {
+            protocol.runCoordinatedMutation(
+                applyRoom = { database.categoryRows["item"] = "新分类"; error("injected room failure") },
+                applySettings = { settings.current = newSettings; true }
+            )
+        }
+
+        assertEquals("旧分类", database.categoryRows["item"])
+        assertEquals(oldSettings, settings.current)
+        assertNull(database.journal)
+    }
+
+    @Test
+    fun renameSettingsCommitFailureRollsBackRoomAndSettings() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "旧分类" }
+        val settings = FakeSettings(oldSettings)
+        val protocol = protocol(database, settings)
+
+        assertFailsWith<RestoreConsistencyException> {
+            protocol.runCoordinatedMutation(
+                applyRoom = { database.categoryRows["item"] = "新分类"; 1 },
+                applySettings = { settings.current = newSettings; false }
+            )
+        }
+
+        assertEquals("旧分类", database.categoryRows["item"])
+        assertEquals(oldSettings, settings.current)
+        assertNull(database.journal)
+    }
+
+    @Test
+    fun renameRollbackFailureLeavesJournalForFailClosedRecovery() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "旧分类" }
+        val settings = FakeSettings(oldSettings).apply { rollbackReturnsFalse = true }
+        val protocol = protocol(database, settings)
+
+        val error = assertFailsWith<RestoreConsistencyException> {
+            protocol.runCoordinatedMutation(
+                applyRoom = { database.categoryRows["item"] = "新分类"; 1 },
+                applySettings = { settings.current = newSettings; false }
+            )
+        }
+
+        assertTrue(error.recoveryIncomplete)
+        assertEquals("旧分类", database.categoryRows["item"])
+        assertEquals(newSettings, settings.current)
+        assertEquals(RestoreJournalState.Prepared, database.journal?.state)
+    }
+
+    @Test
+    fun moveRoomFailureKeepsContentUnderItsOriginalCategory() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "来源" }
+        val settings = FakeSettings(oldSettings)
+        val protocol = protocol(database, settings)
+
+        assertFailsWith<IllegalStateException> {
+            protocol.runCoordinatedMutation(
+                applyRoom = { database.categoryRows["item"] = "目标"; error("injected move failure") },
+                applySettings = { settings.current = newSettings; true }
+            )
+        }
+
+        assertEquals("来源", database.categoryRows["item"])
+        assertEquals(oldSettings, settings.current)
+        assertNull(database.journal)
+    }
+
+    @Test
+    fun moveSettingsFailureRollsBackRoomMutation() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "来源" }
+        val settings = FakeSettings(oldSettings)
+        val protocol = protocol(database, settings)
+
+        assertFailsWith<RestoreConsistencyException> {
+            protocol.runCoordinatedMutation(
+                applyRoom = { database.categoryRows["item"] = "目标"; 1 },
+                applySettings = { false }
+            )
+        }
+
+        assertEquals("来源", database.categoryRows["item"])
+        assertEquals(oldSettings, settings.current)
+        assertNull(database.journal)
+    }
+
+    @Test
+    fun removeCategorySettingsFailureDoesNotDeleteUserContent() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "自定义" }
+        val settings = FakeSettings(oldSettings)
+        val protocol = protocol(database, settings)
+
+        assertFailsWith<RestoreConsistencyException> {
+            protocol.runCoordinatedMutation(
+                applyRoom = { database.categoryRows["item"] = "其他"; 1 },
+                applySettings = { false }
+            )
+        }
+
+        assertEquals(setOf("item"), database.items)
+        assertEquals("自定义", database.categoryRows["item"])
+        assertEquals(oldSettings, settings.current)
+    }
+
+    @Test
+    fun confirmedDeleteCommitsContentAndMetadataTogether() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "自定义" }
+        val settings = FakeSettings(oldSettings)
+        val protocol = protocol(database, settings)
+
+        val deleted = protocol.runCoordinatedMutation(
+            applyRoom = { database.items.remove("item"); database.categoryRows.remove("item"); 1 },
+            applySettings = { settings.current = PortableBackupSettings(emptyList(), emptyMap(), emptyList()); true }
+        )
+
+        assertEquals(1, deleted)
+        assertTrue(database.items.isEmpty())
+        assertTrue(database.categoryRows.isEmpty())
+        assertEquals(PortableBackupSettings(emptyList(), emptyMap(), emptyList()), settings.current)
+        assertNull(database.journal)
+    }
+
+    @Test
+    fun confirmedDeleteSettingsFailureRollsBackContentDeletion() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "自定义" }
+        val settings = FakeSettings(oldSettings)
+        val protocol = protocol(database, settings)
+
+        assertFailsWith<RestoreConsistencyException> {
+            protocol.runCoordinatedMutation(
+                applyRoom = { database.items.remove("item"); database.categoryRows.remove("item"); 1 },
+                applySettings = { false }
+            )
+        }
+
+        assertEquals(setOf("item"), database.items)
+        assertEquals("自定义", database.categoryRows["item"])
+        assertEquals(oldSettings, settings.current)
+        assertNull(database.journal)
+    }
+
+    @Test
+    fun restartAfterInterruptedCategoryMutationRestoresPreOperationState() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply {
+            categoryRows["item"] = "旧分类"
+            simulatedProcessDeathAfterSettings = true
+        }
+        val settings = FakeSettings(oldSettings)
+        val firstProcess = protocol(database, settings)
+
+        assertFailsWith<SimulatedProcessDeath> {
+            firstProcess.runCoordinatedMutation(
+                applyRoom = { database.categoryRows["item"] = "新分类"; 1 },
+                applySettings = { settings.current = newSettings; true }
+            )
+        }
+        assertEquals("旧分类", database.categoryRows["item"])
+        assertEquals(RestoreJournalState.Prepared, database.journal?.state)
+        assertEquals(newSettings, settings.current)
+
+        protocol(database, settings)
+
+        assertEquals("旧分类", database.categoryRows["item"])
+        assertEquals(oldSettings, settings.current)
+        assertNull(database.journal)
+        assertNull(settings.staged)
+    }
+
     private fun protocol(database: FakeDatabase, settings: FakeSettings) = RestoreProtocol(
         database = database,
         settings = settings,
@@ -214,7 +405,7 @@ class RestoreProtocolTest {
 
     private fun journal(state: RestoreJournalState) = RestoreJournal(
         operationId = "operation-1",
-        mode = RestoreMode.Replace,
+        operation = RestoreJournalOperation.Replace,
         state = state,
         startedAtMillis = 100L
     )
@@ -226,9 +417,11 @@ class RestoreProtocolTest {
     ) : RestoreDatabaseGateway {
         val items = items.toMutableSet()
         val credentials = credentials.toMutableSet()
+        val categoryRows = mutableMapOf<String, String>()
         var journal: RestoreJournal? = initialJournal
         var lastPreparedJournal: RestoreJournal? = null
         var failTransactionAfterSettings = false
+        var simulatedProcessDeathAfterSettings = false
 
         override fun currentJournal(): RestoreJournal? = journal
 
@@ -241,6 +434,7 @@ class RestoreProtocolTest {
         override fun restoreInTransaction(
             payload: BackupPayload,
             mode: RestoreMode,
+            operationId: String,
             applySettings: () -> Unit
         ): RestoreCounts {
             val oldItems = items.toSet()
@@ -267,6 +461,31 @@ class RestoreProtocolTest {
             }
         }
 
+        override fun <T> runCoordinatedMutationInTransaction(
+            operationId: String,
+            applyRoom: () -> T,
+            applySettings: () -> Unit
+        ): T {
+            val oldItems = items.toSet()
+            val oldRows = categoryRows.toMap()
+            val oldJournal = journal
+            return try {
+                val result = applyRoom()
+                applySettings()
+                if (simulatedProcessDeathAfterSettings) throw SimulatedProcessDeath()
+                if (failTransactionAfterSettings) error("injected database transaction failure")
+                journal = checkNotNull(journal).copy(state = RestoreJournalState.DatabaseCommitted)
+                result
+            } catch (error: Throwable) {
+                items.clear()
+                items.addAll(oldItems)
+                categoryRows.clear()
+                categoryRows.putAll(oldRows)
+                journal = oldJournal
+                throw error
+            }
+        }
+
         override fun clearJournal(operationId: String) {
             check(journal?.operationId == operationId)
             journal = null
@@ -279,6 +498,7 @@ class RestoreProtocolTest {
         var stageError: RuntimeException? = null
         var applyReturnsFalse = false
         var applyError: RuntimeException? = null
+        var rollbackReturnsFalse = false
 
         override fun stageRollback(operationId: String): Boolean {
             stageError?.let { throw it }
@@ -301,6 +521,7 @@ class RestoreProtocolTest {
         }
 
         override fun rollback(operationId: String): Boolean {
+            if (rollbackReturnsFalse) return false
             val rollback = staged ?: return false
             if (rollback.first != operationId) return false
             current = rollback.second
@@ -316,6 +537,7 @@ class RestoreProtocolTest {
     }
 
     private class SettingsEncryptionFailure : RuntimeException("injected encryption failure")
+    private class SimulatedProcessDeath : Error("simulated process termination")
 
     private companion object {
         val oldSettings = PortableBackupSettings(

@@ -10,9 +10,8 @@ import android.widget.Toast
 import com.privacyhub.R
 import com.privacyhub.data.repository.AutofillCredentialRepository
 import com.privacyhub.presentation.security.SecureActivity
+import com.privacyhub.util.ActivityTaskScope
 import android.service.autofill.Dataset
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 
 /**
  * Android launches this activity only after the user selects an Autofill candidate.
@@ -20,8 +19,7 @@ import java.util.concurrent.Executors
  * this activity returns the credential values to the requesting application.
  */
 class AutofillAuthenticationActivity : SecureActivity() {
-    private val repository by lazy { AutofillCredentialRepository(this) }
-    private val databaseExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val tasks by lazy { ActivityTaskScope(this) }
 
     override fun onUnlocked() {
         val credentialId = intent.getLongExtra(EXTRA_CREDENTIAL_ID, NO_CREDENTIAL_ID)
@@ -52,35 +50,46 @@ class AutofillAuthenticationActivity : SecureActivity() {
         usernameId: android.view.autofill.AutofillId?,
         passwordId: android.view.autofill.AutofillId?
     ) {
-        databaseExecutor.execute {
-            val credential = repository.getById(credentialId)
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                if (credential == null) {
-                    fail("登录信息已不存在")
-                    return@runOnUiThread
-                }
-                if (!credential.matchesAutofillScope(confirmedScope)) {
-                    fail("登录信息不适用于当前页面")
-                    return@runOnUiThread
-                }
-                // A presentation is unused after authentication on modern Android, but some
-                // vendor Autofill implementations still require it on the returned dataset.
-                val presentation = RemoteViews(packageName, R.layout.autofill_dataset).apply {
-                    setTextViewText(R.id.autofill_label, credential.label)
-                }
-                val dataset = Dataset.Builder(presentation).apply {
-                    usernameId?.let { setValue(it, AutofillValue.forText(credential.username)) }
-                    passwordId?.let { setValue(it, AutofillValue.forText(credential.password)) }
-                }.build()
-                setResult(RESULT_OK, Intent().putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, dataset))
-                finish()
+        val app = applicationContext
+        val generation = tasks.nextGeneration()
+        tasks.executeDisk(
+            generation,
+            task = { AutofillCredentialRepository(app).getById(credentialId) },
+            onResult = { owner, result ->
+                val activity = owner as AutofillAuthenticationActivity
+                result.fold(
+                    onSuccess = { credential ->
+                        if (credential == null) {
+                            activity.fail("登录信息已不存在")
+                            return@fold
+                        }
+                        if (!credential.matchesAutofillScope(confirmedScope)) {
+                            activity.fail("登录信息不适用于当前页面")
+                            return@fold
+                        }
+                        // A presentation is unused after authentication on modern Android, but some
+                        // vendor Autofill implementations still require it on the returned dataset.
+                        val presentation = RemoteViews(activity.packageName, R.layout.autofill_dataset).apply {
+                            setTextViewText(R.id.autofill_label, credential.label)
+                        }
+                        val dataset = Dataset.Builder(presentation).apply {
+                            usernameId?.let { setValue(it, AutofillValue.forText(credential.username)) }
+                            passwordId?.let { setValue(it, AutofillValue.forText(credential.password)) }
+                        }.build()
+                        activity.setResult(
+                            RESULT_OK,
+                            Intent().putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, dataset)
+                        )
+                        activity.finish()
+                    },
+                    onFailure = { activity.fail("无法读取登录信息") }
+                )
             }
-        }
+        )
     }
 
     override fun onDestroy() {
-        databaseExecutor.shutdownNow()
+        tasks.close()
         super.onDestroy()
     }
 

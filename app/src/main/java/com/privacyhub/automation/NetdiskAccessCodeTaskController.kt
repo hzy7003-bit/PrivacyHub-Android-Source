@@ -31,6 +31,9 @@ object NetdiskAccessCodeTaskController {
         registry.updateExpectedPackage(id, packageName)
     }
 
+    fun hasActiveTaskForPackage(packageName: String): Boolean =
+        registry.hasActiveTaskForPackage(packageName)
+
     fun matching(packageName: String, currentHost: String?): PendingNetdiskAccessCodeTask? =
         registry.match(packageName, currentHost)
 

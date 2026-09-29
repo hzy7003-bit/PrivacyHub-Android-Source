@@ -1,6 +1,7 @@
 package com.privacyhub.router
 
 import android.app.Activity
+import android.content.Context
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
@@ -15,8 +16,8 @@ data class OpenResult(
 
 object BrowserFallback {
     /** Resolves the user's browser without matching a URL that may be verified by a target app. */
-    fun resolveDefaultBrowserPackage(activity: Activity): String? = resolvePackage(
-        activity,
+    fun resolveDefaultBrowserPackage(context: Context): String? = resolvePackage(
+        context,
         browserIntent("https://privacyhub-browser-resolution.invalid/")
     )
 
@@ -62,8 +63,8 @@ object BrowserFallback {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
 
-    private fun resolvePackage(activity: Activity, intent: Intent): String? = try {
-        activity.packageManager.resolveActivity(intent, 0)
+    private fun resolvePackage(context: Context, intent: Intent): String? = try {
+        context.packageManager.resolveActivity(intent, 0)
             ?.activityInfo
             ?.packageName
     } catch (_: SecurityException) {
