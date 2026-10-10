@@ -28,12 +28,12 @@ object LinkCleaner {
             }
             .joinToString("&")
 
-        return URI(
-            uri.scheme,
-            uri.rawAuthority,
-            uri.rawPath,
-            keptQuery.ifBlank { null },
-            uri.rawFragment
-        ).toString()
+        // The URI component constructor escapes '%' again. Retain the original raw path and
+        // fragment while replacing only the parsed query, so valid escapes stay byte-for-byte.
+        val queryStart = url.indexOf('?')
+        val fragmentStart = url.indexOf('#', queryStart + 1)
+        val suffix = if (fragmentStart >= 0) url.substring(fragmentStart) else ""
+        return url.substring(0, queryStart) +
+            (if (keptQuery.isBlank()) "" else "?$keptQuery") + suffix
     }
 }

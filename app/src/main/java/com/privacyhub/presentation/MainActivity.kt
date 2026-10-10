@@ -393,7 +393,12 @@ class MainActivity : SecureActivity() {
             addView(views.row("从剪贴板粘贴") {
                 sheet.dismiss()
                 val result = ClipboardReader.readText(this@MainActivity)
-                if (result.text.isNullOrBlank()) Toast.makeText(this@MainActivity, "剪贴板中没有可读取的文本", Toast.LENGTH_SHORT).show()
+                if (result.text.isNullOrBlank()) Toast.makeText(
+                    this@MainActivity,
+                    if (result.failureReason == ClipboardReader.TEXT_TOO_LARGE_REASON) ClipboardReader.TEXT_TOO_LARGE_REASON
+                    else "剪贴板中没有可读取的文本",
+                    Toast.LENGTH_LONG
+                ).show()
                 else receive(result.text)
             }.apply { layoutParams = LinearLayout.LayoutParams(-1, views.dp(UiMetrics.Row)).apply { bottomMargin = 0 } })
             addView(views.row("手动输入") { sheet.dismiss(); showInput() }.apply {

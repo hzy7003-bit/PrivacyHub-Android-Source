@@ -24,6 +24,7 @@ import androidx.lifecycle.ViewModelProvider
 import com.privacyhub.classifier.VaultContentSuggester
 import com.privacyhub.data.repository.LocalStore
 import com.privacyhub.data.settings.AppSettingsStore
+import com.privacyhub.data.settings.CategorySettingsStore
 import com.privacyhub.domain.model.VaultItem
 import com.privacyhub.presentation.security.SecureActivity
 import com.privacyhub.presentation.ui.ButtonKind
@@ -41,7 +42,9 @@ import com.privacyhub.util.SingleFlightGate
 class VaultDetailActivity : SecureActivity() {
     private val store by lazy { LocalStore(this) }
     private val tasks by lazy { ActivityTaskScope(this) }
-    private val settingsStore by lazy { AppSettingsStore(this) }
+    private val suggestionTasks by lazy { ActivityTaskScope(this) }
+    private var suggestedCategories: Map<String, String>? = null
+    private var suggestionLookupPending = false
     private var itemId: Long = 0L
     private var createMode: Boolean = false
     private var item: VaultItem? = null
@@ -74,7 +77,8 @@ class VaultDetailActivity : SecureActivity() {
     override fun onPause() {
         if (formVisible && ::contentInput.isInitialized) {
             draftModel.draft = DetailDraft(titleInput.text.toString(), contentInput.text.toString(),
-                categoryInput.text.toString(), noteInput.text.toString(), accessCodeInput?.text?.toString())
+                categoryInput.text.toString(), noteInput.text.toString(), accessCodeInput?.text?.toString(),
+                categoryEditedByUser)
         }
         super.onPause()
     }
@@ -98,6 +102,7 @@ class VaultDetailActivity : SecureActivity() {
 
     override fun onDestroy() {
         tasks.close()
+        suggestionTasks.close()
         super.onDestroy()
     }
 
@@ -176,10 +181,11 @@ class VaultDetailActivity : SecureActivity() {
             noteInput.setText(draft.note)
             accessCodeInput?.setText(draft.accessCode)
             titleEditedByUser = draft.title.isNotBlank()
-            categoryEditedByUser = draft.category.isNotBlank()
+            categoryEditedByUser = draft.categoryEditedByUser
         }
         if (createMode) {
             installSuggestionWatchers()
+            loadSuggestedCategories()
         }
 
         fun field(label: String, input: EditText) {
@@ -490,7 +496,9 @@ class VaultDetailActivity : SecureActivity() {
         if (createMode) {
             val app = applicationContext
             val saveTitle = titleInput.text?.toString().orEmpty().trim()
-            val saveCategory = categoryInput.text?.toString().orEmpty().trim()
+            // The displayed suggestion may precede alias lookup. Resolve automatic categories
+            // through the existing mapper on the save worker; only user input is explicit.
+            val saveCategory = if (categoryEditedByUser) categoryInput.text?.toString()?.trim() else null
             val saveNote = noteInput.text?.toString().orEmpty().trim()
             if (!operationGate.tryAcquire()) return
             saveButton?.isEnabled = false
@@ -645,6 +653,25 @@ class VaultDetailActivity : SecureActivity() {
         })
     }
 
+    private fun loadSuggestedCategories() {
+        if (suggestedCategories != null || suggestionLookupPending) return
+        suggestionLookupPending = true
+        val app = applicationContext
+        suggestionTasks.executeDisk(
+            suggestionTasks.nextGeneration(),
+            task = {
+                val settings = AppSettingsStore(app)
+                CategorySettingsStore.DEFAULT_CATEGORIES.associateWith(settings::resolveSuggestedCategory)
+            },
+            onResult = { owner, result ->
+                val activity = owner as VaultDetailActivity
+                activity.suggestionLookupPending = false
+                activity.suggestedCategories = result.getOrDefault(emptyMap())
+                if (activity.formVisible) activity.applySuggestionIfAllowed(force = false)
+            }
+        )
+    }
+
     private fun applySuggestionIfAllowed(force: Boolean) {
         if (!createMode) return
         val content = contentInput.text?.toString().orEmpty().trim()
@@ -652,7 +679,7 @@ class VaultDetailActivity : SecureActivity() {
         val url = LinkParser.extractFirstUrl(content)
         val target = LinkTargetDetector.detect(content)
         val suggestion = VaultContentSuggester.suggest(content, url, target)
-        val category = settingsStore.resolveSuggestedCategory(suggestion.category)
+        val category = suggestedCategories?.get(suggestion.category) ?: suggestion.category
 
         autoFillingSuggestion = true
         if (force || !titleEditedByUser || titleInput.text.isNullOrBlank()) {

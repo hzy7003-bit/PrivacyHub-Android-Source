@@ -101,7 +101,12 @@ class NotificationEntryActivity : Activity() {
                     if (reportResult.exceptionOrNull() is VaultDatabaseUnavailableException) {
                         activity.showDatabaseUnavailable()
                     } else {
-                        Toast.makeText(activity, "读取剪切板失败", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(
+                            activity,
+                            if (result.failureReason == ClipboardReader.TEXT_TOO_LARGE_REASON) ClipboardReader.TEXT_TOO_LARGE_REASON
+                            else "读取剪切板失败",
+                            Toast.LENGTH_LONG
+                        ).show()
                         activity.closeNotificationTask()
                     }
                 }
@@ -123,7 +128,12 @@ class NotificationEntryActivity : Activity() {
                     if (reportResult.exceptionOrNull() is VaultDatabaseUnavailableException) {
                         activity.showDatabaseUnavailable()
                     } else {
-                        Toast.makeText(activity, "读取剪切板失败", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(
+                            activity,
+                            if (result.failureReason == ClipboardReader.TEXT_TOO_LARGE_REASON) ClipboardReader.TEXT_TOO_LARGE_REASON
+                            else "读取剪切板失败",
+                            Toast.LENGTH_LONG
+                        ).show()
                         activity.closeNotificationTask()
                     }
                 }

@@ -268,7 +268,6 @@ internal class RestoreProtocol(
 internal object BackupPayloadValidator {
     private const val MAX_RECORD_COUNT = 50_000
     private const val MAX_SETTINGS_COUNT = 1_000
-    private const val MAX_TEXT_BYTES = 1_048_576
     private const val MAX_CATEGORY_NAME_LENGTH = 16
     private const val MAX_HOME_TAGS = 5
 
@@ -371,7 +370,7 @@ internal object BackupPayloadValidator {
     }
 
     private fun validateText(value: String) {
-        if (value.encodeToByteArray().size > MAX_TEXT_BYTES) invalid("单条备份内容过大。")
+        if (value.encodeToByteArray().size > BackupPayloadCodec.MAX_TEXT_BYTES) invalid("单条备份内容过大。")
     }
 
     private fun invalid(message: String): Nothing = throw BackupFormatException(message)

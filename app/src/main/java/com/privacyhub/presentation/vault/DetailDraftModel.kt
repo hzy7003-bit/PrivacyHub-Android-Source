@@ -12,5 +12,6 @@ data class DetailDraft(
     val content: String,
     val category: String,
     val note: String,
-    val accessCode: String?
+    val accessCode: String?,
+    val categoryEditedByUser: Boolean
 )

@@ -224,6 +224,51 @@ class RestoreProtocolTest {
     }
 
     @Test
+    fun categoryMutationFailureAfterFirstSettingsWriteNeverReportsSuccess() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "旧分类" }
+        val settings = FakeSettings(oldSettings)
+        val protocol = protocol(database, settings)
+
+        assertFailsWith<RestoreConsistencyException> {
+            protocol.runCoordinatedMutation(
+                applyRoom = { database.categoryRows["item"] = "新分类"; 1 },
+                applySettings = {
+                    settings.current = oldSettings.copy(customCategories = listOf("新分类"))
+                    // A second encrypted-settings commit (for example, an alias update) fails.
+                    false
+                }
+            )
+        }
+
+        assertEquals("旧分类", database.categoryRows["item"])
+        assertEquals(oldSettings, settings.current)
+        assertNull(database.journal)
+        assertNull(settings.staged)
+    }
+
+    @Test
+    fun categoryMutationDatabaseCommitFailureRestoresSettingsWrittenEarlier() {
+        val database = FakeDatabase(setOf("item"), emptySet()).apply {
+            categoryRows["item"] = "旧分类"
+            failTransactionAfterSettings = true
+        }
+        val settings = FakeSettings(oldSettings)
+        val protocol = protocol(database, settings)
+
+        assertFailsWith<IllegalStateException> {
+            protocol.runCoordinatedMutation(
+                applyRoom = { database.categoryRows["item"] = "新分类"; 1 },
+                applySettings = { settings.current = newSettings; true }
+            )
+        }
+
+        assertEquals("旧分类", database.categoryRows["item"])
+        assertEquals(oldSettings, settings.current)
+        assertNull(database.journal)
+        assertNull(settings.staged)
+    }
+
+    @Test
     fun renameRollbackFailureLeavesJournalForFailClosedRecovery() {
         val database = FakeDatabase(setOf("item"), emptySet()).apply { categoryRows["item"] = "旧分类" }
         val settings = FakeSettings(oldSettings).apply { rollbackReturnsFalse = true }

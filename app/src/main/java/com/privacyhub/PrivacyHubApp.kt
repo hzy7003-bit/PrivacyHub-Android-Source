@@ -6,17 +6,22 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import com.privacyhub.backup.VaultBackupRepository
+import com.privacyhub.data.db.DatabaseAccessCoordinator
+import com.privacyhub.data.db.RestoreRecoveryPendingException
 import com.privacyhub.data.settings.AppSettingsStore
 import com.privacyhub.diagnostics.CrashRecorder
 import com.privacyhub.presentation.notification.SaveNotificationManager
 import com.privacyhub.security.lock.AppLockSession
+import com.privacyhub.util.AppExecutors
 
 class PrivacyHubApp : Application() {
     override fun onCreate() {
         super.onCreate()
         CrashRecorder(this).install()
         AppLockSession.install(this)
-        recoverPendingRestore()
+        // Block ordinary vault access before the worker starts recovery.
+        DatabaseAccessCoordinator.markRestoreRecoveryPending(RestoreRecoveryPendingException())
+        AppExecutors.executeDisk { recoverPendingRestore() }
         refreshPersistentNotificationIfEnabled()
     }
 

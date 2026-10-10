@@ -1,6 +1,7 @@
 package com.privacyhub.data.repository
 
 import android.content.Context
+import com.privacyhub.backup.BackupPayloadCodec
 import com.privacyhub.data.db.PrivacyHubDatabaseProvider
 import com.privacyhub.data.mapper.VaultItemMapper
 import com.privacyhub.data.settings.AppSettingsStore
@@ -23,6 +24,7 @@ class VaultRepositoryImpl(context: Context) {
         primaryUrl: String?,
         target: LinkTarget
     ): Long {
+        BackupPayloadCodec.requireCompatibleText(originalText)
         return dao.insert(
             VaultItemMapper.newVaultEntity(
                 entryPoint = entryPoint,
@@ -41,6 +43,7 @@ class VaultRepositoryImpl(context: Context) {
         category: String?,
         note: String?
     ): Long {
+        listOfNotNull(title, content, note).forEach(BackupPayloadCodec::requireCompatibleText)
         val originalLink = LinkParser.extractFirstUrl(content)
         val target = LinkTargetDetector.detect(content)
         return dao.insert(
@@ -123,6 +126,7 @@ class VaultRepositoryImpl(context: Context) {
         category: String?,
         note: String?
     ) {
+        listOfNotNull(title, content, note).forEach(BackupPayloadCodec::requireCompatibleText)
         val originalLink = LinkParser.extractFirstUrl(content)
         val target = LinkTargetDetector.detect(content)
         dao.updateDetails(

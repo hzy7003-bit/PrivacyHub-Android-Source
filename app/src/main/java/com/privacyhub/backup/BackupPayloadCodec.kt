@@ -11,7 +11,18 @@ object BackupPayloadCodec {
     private const val LEGACY_FORMAT_VERSION = 1
     private const val MAX_ITEM_COUNT = 50_000
     private const val MAX_COLLECTION_SIZE = 1_000
-    private const val MAX_TEXT_BYTES = 1_048_576
+    internal const val MAX_TEXT_BYTES = 1_048_576
+
+    internal fun isCompatibleText(value: String): Boolean {
+        if (value.length > MAX_TEXT_BYTES) return false
+        return value.encodeToByteArray().size <= MAX_TEXT_BYTES
+    }
+
+    internal fun requireCompatibleText(value: String) {
+        if (!isCompatibleText(value)) {
+            throw BackupFormatException("文本超过 1 MiB 备份上限，未保存。")
+        }
+    }
 
     fun encode(payload: BackupPayload): ByteArray {
         return ByteArrayOutputStream().use { bytes ->

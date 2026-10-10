@@ -12,6 +12,14 @@ import kotlin.test.assertTrue
 
 class DatabaseAccessCoordinatorTest {
     @Test
+    fun normalStartupAndSuccessfulRestoreAllowOrdinaryAccess() {
+        DatabaseAccessCoordinator.markRestoreRecoveryComplete()
+        assertEquals("startup", DatabaseAccessCoordinator.withDatabaseAccess { "startup" })
+        assertEquals("restored", DatabaseAccessCoordinator.withRestoreAccess { "restored" })
+        assertEquals("write", DatabaseAccessCoordinator.withDatabaseWriteAccess { "write" })
+    }
+
+    @Test
     fun ordinaryDatabaseAccessWaitsUntilRestoreFinishes() {
         val executor = Executors.newFixedThreadPool(2)
         val restoreStarted = CountDownLatch(1)
@@ -86,6 +94,18 @@ class DatabaseAccessCoordinatorTest {
                 DatabaseAccessCoordinator.withDatabaseAccess { "must not read" }
             }
             assertEquals(recoveryError, unavailable.cause)
+            assertFailsWith<VaultDatabaseUnavailableException> {
+                DatabaseAccessCoordinator.withDatabaseWriteAccess { "must not write" }
+            }
+
+            // A second failed recovery must keep the first failure's fail-closed state.
+            val rollbackError = IllegalStateException("rollback failed")
+            DatabaseAccessCoordinator.withRestoreAccess {
+                DatabaseAccessCoordinator.markRestoreRecoveryPending(rollbackError)
+            }
+            assertEquals(rollbackError, assertFailsWith<VaultDatabaseUnavailableException> {
+                DatabaseAccessCoordinator.withDatabaseAccess { "must not read" }
+            }.cause)
 
             DatabaseAccessCoordinator.withRestoreAccess {
                 DatabaseAccessCoordinator.markRestoreRecoveryComplete()

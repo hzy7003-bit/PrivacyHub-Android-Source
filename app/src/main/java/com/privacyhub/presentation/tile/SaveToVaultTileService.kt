@@ -38,6 +38,12 @@ class SaveToVaultTileService : TileService() {
     private fun readClipboardAndSave(note: String) {
         val result = ClipboardReader.readText(applicationContext)
 
+        if (result.failureReason == ClipboardReader.TEXT_TOO_LARGE_REASON) {
+            updateTile("内容过大")
+            showToast(ClipboardReader.TEXT_TOO_LARGE_REASON)
+            return
+        }
+
         if (result.success) {
             val text = result.text.orEmpty()
             val app = applicationContext

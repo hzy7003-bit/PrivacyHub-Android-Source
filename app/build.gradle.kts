@@ -146,8 +146,8 @@ android {
         applicationId = "com.privacyhub"
         minSdk = 26
         targetSdk = 35
-        versionCode = localOrGradleProperty("privacyHub.versionCode")?.toIntOrNull() ?: 132
-        versionName = localOrGradleProperty("privacyHub.versionName") ?: "0.10.4-beta"
+        versionCode = localOrGradleProperty("privacyHub.versionCode")?.toIntOrNull() ?: 134
+        versionName = localOrGradleProperty("privacyHub.versionName") ?: "0.10.6-beta"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
